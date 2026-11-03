@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-import random # Добавили для случайной задержки
+import random
 
 import feedparser
 import requests
@@ -149,7 +149,7 @@ def rewrite(item, article_text):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "openai/gpt-oss-20b",
+        "model": "openai/gpt-oss-20b", 
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
         "temperature": 0.8 
@@ -265,10 +265,15 @@ def main():
     batch = fresh[:MAX_PER_RUN]
 
     for item in reversed(batch):
-        # ЗАДЕРЖКА ОТ 10 МИНУТ ДО 1 ЧАСА 50 МИНУТ (600 - 6600 секунд)
-        delay = random.randint(600, 6600)
-        print(f"Ждем {delay // 60} мин. перед публикацией...")
-        time.sleep(delay)
+        # Проверяем, тестовый ли это запуск (передается из bot.yml)
+        is_test = os.environ.get("TEST_RUN", "false").lower() == "true"
+        
+        if is_test:
+            print("🧪 Тестовый режим: публикуем сразу без задержки...")
+        else:
+            delay = random.randint(600, 6600) # от 10 мин до 1 ч 50 мин
+            print(f"Ждем {delay // 60} мин. перед публикацией...")
+            time.sleep(delay)
 
         article_text, img = fetch_article(item["link"])
         ai = rewrite(item, article_text)
