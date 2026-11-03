@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import random # Добавили для случайной задержки
 
 import feedparser
 import requests
@@ -13,7 +14,7 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHANNEL"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
-MAX_PER_RUN = 3      # сколько постов максимум за один запуск
+MAX_PER_RUN = 1      # Постим только 1 новость за запуск
 MAX_AGE_HOURS = 24   # старше этого не постим
 STATE_FILE = "posted.json"
 
@@ -127,7 +128,6 @@ def rewrite(item, article_text):
 
     source_text = article_text or item["summary"]
     
-    # Обновленный промпт: просим больше контекста и шутку в конце
     prompt = (
         "Ты редактор крутого Telegram-канала про игры и нейросети. "
         f"Стиль: {STYLE}\n"
@@ -149,10 +149,10 @@ def rewrite(item, article_text):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "llama-3.1-8b-instant", # Или используй llama-3.3-70b-versatile для более умных шуток
+        "model": "openai/gpt-oss-20b",
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
-        "temperature": 0.8 # Чуть повысил температуру, чтобы шутки были креативнее
+        "temperature": 0.8 
     }
 
     try:
@@ -186,19 +186,15 @@ def build_post(item, ai, with_points=True):
         return "\n".join(lines)
 
     icon = ai.get("emoji") or default_icon
-    # Добавляем контекст
     lines = [f"{icon} <b>{esc(str(ai['title']))}</b>", "", esc(str(ai["context"]))]
 
-    # Добавляем факты
     points = [str(p) for p in (ai.get("points") or [])][:3]
     if with_points and points:
         lines += [""] + [f"▪️ {esc(p)}" for p in points]
 
-    # Добавляем шутку
     if ai.get("joke"):
         lines += ["", f"😅 <i>{esc(str(ai['joke']))}</i>"]
 
-    # Добавляем теги
     tags = []
     base = BASE_TAGS.get(item["topic"])
     if base:
@@ -234,14 +230,21 @@ def send_post(item, ai, img):
         if len(text) > 1000:
             text = build_post(item, ai, with_points=False)
         if len(text) <= 1000:
-            ok = tg("sendPhoto", {
-                "chat_id": CHAT_ID,
-                "photo": img,
-                "caption": text,
-                "parse_mode": "HTML",
-            })
+            try:
+                img_data = requests.get(img, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).content
+                ok = tg("sendPhoto", {
+                    "chat_id": CHAT_ID,
+                    "photo": img_data,
+                    "caption": text,
+                    "parse_mode": "HTML",
+                })
+            except Exception as e:
+                print("image download failed:", e)
+                ok = False
+            
             if ok:
                 return True
+                
     return tg("sendMessage", {
         "chat_id": CHAT_ID,
         "text": text,
@@ -262,6 +265,11 @@ def main():
     batch = fresh[:MAX_PER_RUN]
 
     for item in reversed(batch):
+        # ЗАДЕРЖКА ОТ 10 МИНУТ ДО 1 ЧАСА 50 МИНУТ (600 - 6600 секунд)
+        delay = random.randint(600, 6600)
+        print(f"Ждем {delay // 60} мин. перед публикацией...")
+        time.sleep(delay)
+
         article_text, img = fetch_article(item["link"])
         ai = rewrite(item, article_text)
         if send_post(item, ai, img):
