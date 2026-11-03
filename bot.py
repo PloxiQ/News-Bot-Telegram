@@ -14,20 +14,20 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHANNEL"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
-MAX_PER_RUN = 1      # Постим только 1 новость за запуск
-MAX_AGE_HOURS = 24   # старше этого не постим
+MAX_PER_RUN = 1      
+MAX_AGE_HOURS = 24   
 STATE_FILE = "posted.json"
 
-# Хэштег, который ставится всегда
+# Дефолтная обложка, если у новости нет картинки (стильный неоновый гейминг/ИИ)
+DEFAULT_IMG = "https://images.unsplash.com/photo-1550745165-9bc0b252726f?q=80&w=1080&auto=format&fit=crop"
+
 BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети"}
 
-# Стиль постов
 STYLE = (
-    "Живой, чуть неформальный тон для молодой аудитории, без канцелярита. "
-    "Пиши коротко и по делу, как крутой новостной блогер."
+    "Живой, динамичный тон успешного Telegram-блогера. Без канцелярита, воды и кликбейта. "
+    "Пиши так, чтобы хотелось переслать другу."
 )
 
-# Источники новостей
 FEEDS = [
     # Игры
     ("игры", "https://stopgame.ru/rss/rss_news.xml"),
@@ -42,7 +42,6 @@ FEEDS = [
     ("нейросети", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
 ]
 
-
 def channel_footer():
     link = os.environ.get("CHANNEL_LINK", "").strip()
     if not link and CHAT_ID.startswith("@"):
@@ -51,7 +50,6 @@ def channel_footer():
         return ""
     return f'📢 <a href="{html.escape(link, quote=True)}">Подписывайся на канал</a>'
 
-
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -59,22 +57,18 @@ def load_state():
     except Exception:
         return []
 
-
 def save_state(seen):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(seen[-500:], f, ensure_ascii=False)
-
 
 def clean(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
 
-
 def entry_time(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
     return calendar.timegm(t) if t else None
-
 
 def collect():
     items = []
@@ -98,7 +92,6 @@ def collect():
             print("feed failed:", url, ex)
     return items
 
-
 def fetch_article(url):
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
@@ -120,26 +113,25 @@ def fetch_article(url):
     text = " ".join(p for p in (clean(x) for x in paras) if len(p) > 60)
     return text[:5000], img
 
-
 def rewrite(item, article_text):
-    """Groq генерирует пост с контекстом и шуткой."""
     if not GROQ_KEY:
         return None
 
     source_text = article_text or item["summary"]
     
+    # Улучшенный промпт для идеального формата
     prompt = (
-        "Ты редактор крутого Telegram-канала про игры и нейросети. "
+        "Ты главный редактор топового Telegram-канала про игры и нейросети. "
         f"Стиль: {STYLE}\n"
-        "Твоя задача — сделать из этой новости интересный пост на русском языке. "
+        "Твоя задача — сделать из этой новости идеальный пост на русском языке. "
         "Верни строго JSON с полями:\n"
-        '"emoji": один подходящий эмодзи по теме,\n'
-        '"title": цепляющий заголовок до 80 символов,\n'
-        '"context": подробный контекст (2-3 предложения), объясни суть новости, предысторию или почему это важно. До 400 символов,\n'
+        '"emoji": один подходящий эмодзи по теме (например 🎮 или 🤖),\n'
+        '"title": цепляющий, но правдивый заголовок до 80 символов,\n'
+        '"context": подробный контекст (2-3 предложения). Объясни суть, предысторию или почему это важно. До 400 символов,\n'
         '"points": список из 2-3 коротких ключевых фактов (каждый до 90 символов),\n'
-        '"joke": короткая шутка, ироничный комментарий или мем в тему новости. Если новость серьезная (трагедия, скандал), сделай шутку сдержанной и саркастичной, но не глупой. До 150 символов,\n'
+        '"joke": короткая шутка, ироничный комментарий или мем. Если новость серьезная, сделай шутку сдержанной и саркастичной. До 150 символов,\n'
         '"hashtags": 2-3 хэштега без символа #.\n'
-        "Ничего не выдумывай, используй только факты из текста. Без markdown.\n\n"
+        "Ничего не выдумывай, используй только факты из текста. Если текст на английском - переведи всё на русский. Без markdown.\n\n"
         f"Заголовок: {item['title']}\nТекст: {source_text}"
     )
 
@@ -152,7 +144,7 @@ def rewrite(item, article_text):
         "model": "openai/gpt-oss-20b", 
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
-        "temperature": 0.8 
+        "temperature": 0.7 
     }
 
     try:
@@ -168,32 +160,30 @@ def rewrite(item, article_text):
         print("groq failed:", ex)
         return None
 
-
 def build_post(item, ai, with_points=True):
     esc = html.escape
     default_icon = "🎮" if item["topic"] == "игры" else "🤖"
+    category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ"
+    
     link = f'<a href="{esc(item["link"], quote=True)}">Читать источник</a>'
 
     if not ai:
-        body = item["summary"][:300]
-        lines = [f"{default_icon} <b>{esc(item['title'])}</b>"]
-        if body:
-            lines += ["", esc(body)]
-        lines += ["", BASE_TAGS.get(item["topic"], ""), link]
-        footer = channel_footer()
-        if footer:
-            lines += [footer]
-        return "\n".join(lines)
+        return None # Если нейросеть не ответила, лучше пропустить, чем постить сырой текст
 
     icon = ai.get("emoji") or default_icon
-    lines = [f"{icon} <b>{esc(str(ai['title']))}</b>", "", esc(str(ai["context"]))]
+    
+    # Формируем красивый заголовок
+    lines = [f"{icon} <b>{category}</b>", ""]
+    lines.append(f"<b>{esc(str(ai['title']))}</b>")
+    lines.append("")
+    lines.append(esc(str(ai["context"])))
 
     points = [str(p) for p in (ai.get("points") or [])][:3]
     if with_points and points:
-        lines += [""] + [f"▪️ {esc(p)}" for p in points]
+        lines += [""] + [f"🔹 {esc(p)}" for p in points]
 
     if ai.get("joke"):
-        lines += ["", f"😅 <i>{esc(str(ai['joke']))}</i>"]
+        lines += ["", f"😂 <i>{esc(str(ai['joke']))}</i>"]
 
     tags = []
     base = BASE_TAGS.get(item["topic"])
@@ -212,7 +202,6 @@ def build_post(item, ai, with_points=True):
         lines += [footer]
     return "\n".join(lines)
 
-
 def tg(method, payload):
     r = requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/{method}",
@@ -223,34 +212,39 @@ def tg(method, payload):
         print("telegram error:", method, r.status_code, r.text)
     return r.ok
 
-
 def send_post(item, ai, img):
     text = build_post(item, ai)
-    if img:
-        if len(text) > 1000:
-            text = build_post(item, ai, with_points=False)
-        if len(text) <= 1000:
-            try:
-                img_data = requests.get(img, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).content
-                ok = tg("sendPhoto", {
-                    "chat_id": CHAT_ID,
-                    "photo": img_data,
-                    "caption": text,
-                    "parse_mode": "HTML",
-                })
-            except Exception as e:
-                print("image download failed:", e)
-                ok = False
+    if not text:
+        return False # Пропускаем, если не смогли сгенерировать текст
+
+    # Если картинки нет, ставим дефолтную
+    if not img:
+        img = DEFAULT_IMG
+
+    if len(text) > 1000:
+        text = build_post(item, ai, with_points=False)
+        
+    if len(text) <= 1000:
+        try:
+            img_data = requests.get(img, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).content
+            ok = tg("sendPhoto", {
+                "chat_id": CHAT_ID,
+                "photo": img_data,
+                "caption": text,
+                "parse_mode": "HTML",
+            })
+        except Exception as e:
+            print("image download failed:", e)
+            ok = False
+        
+        if ok:
+            return True
             
-            if ok:
-                return True
-                
     return tg("sendMessage", {
         "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
     })
-
 
 def main():
     seen = load_state()
@@ -262,28 +256,41 @@ def main():
         if i["id"] not in seen and now - i["time"] < MAX_AGE_HOURS * 3600
     ]
     fresh.sort(key=lambda i: i["time"], reverse=True)
-    batch = fresh[:MAX_PER_RUN]
+    
+    # Берем с запасом, чтобы если одна новость сломается, взять следующую
+    candidates = fresh[:5] 
+    posted_count = 0
 
-    for item in reversed(batch):
-        # Проверяем, тестовый ли это запуск (передается из bot.yml)
+    for item in candidates:
+        if posted_count >= MAX_PER_RUN:
+            break
+
+        article_text, img = fetch_article(item["link"])
+        ai = rewrite(item, article_text)
+        
+        # Если нейросеть не смогла обработать - идем к следующей
+        if not ai:
+            print(f"Пропускаем (ошибка ИИ): {item['title']}")
+            continue
+
         is_test = os.environ.get("TEST_RUN", "false").lower() == "true"
         
         if is_test:
             print("🧪 Тестовый режим: публикуем сразу без задержки...")
         else:
-            delay = random.randint(600, 6600) # от 10 мин до 1 ч 50 мин
+            delay = random.randint(600, 6600) 
             print(f"Ждем {delay // 60} мин. перед публикацией...")
             time.sleep(delay)
 
-        article_text, img = fetch_article(item["link"])
-        ai = rewrite(item, article_text)
         if send_post(item, ai, img):
             seen.append(item["id"])
+            posted_count += 1
+            
         time.sleep(5)
 
     save_state(seen)
-    print(f"posted {len(batch)} of {len(fresh)} fresh items")
-
+    print(f"Успешно опубликовано: {posted_count}")
 
 if __name__ == "__main__":
     main()
+    
