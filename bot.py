@@ -8,49 +8,47 @@ import time
 import feedparser
 import requests
 
+# === НАСТРОЙКИ ===
 TG_TOKEN = os.environ["TG_TOKEN"]
-CHAT_ID = os.environ["TG_CHANNEL"]  # например @mychannel
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+CHAT_ID = os.environ["TG_CHANNEL"]
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
 MAX_PER_RUN = 3      # сколько постов максимум за один запуск
 MAX_AGE_HOURS = 24   # старше этого не постим
 STATE_FILE = "posted.json"
 
-# Хэштег, который ставится всегда, плюс 2–3 от нейросети.
+# Хэштег, который ставится всегда
 BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети"}
+
+# Стиль постов
+STYLE = (
+    "Живой, чуть неформальный тон для молодой аудитории, без канцелярита. "
+    "Пиши коротко и по делу, как крутой новостной блогер."
+)
+
+# Источники новостей
+FEEDS = [
+    # Игры
+    ("игры", "https://stopgame.ru/rss/rss_news.xml"),
+    ("игры", "https://www.playground.ru/rss/news.xml"),
+    ("игры", "https://www.pcgamer.com/rss/"),
+    # Нейросети (русские)
+    ("нейросети", "https://habr.com/ru/rss/hubs/artificial_intelligence/articles/?fl=ru"),
+    ("нейросети", "https://vc.ru/rss/tag/нейросети"),
+    ("нейросети", "https://3dnews.ru/news/rss/"),
+    # Нейросети (иностранные)
+    ("нейросети", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("нейросети", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
+]
 
 
 def channel_footer():
-    """Строка со ссылкой на твой канал в конце поста.
-    Берётся из TG_CHANNEL (@имя). Если у канала нет @имени, задай секрет CHANNEL_LINK."""
     link = os.environ.get("CHANNEL_LINK", "").strip()
     if not link and CHAT_ID.startswith("@"):
         link = "https://t.me/" + CHAT_ID[1:]
     if not link:
         return ""
     return f'📢 <a href="{html.escape(link, quote=True)}">Подписывайся на канал</a>'
-
-# Стиль постов. Меняй текст здесь, если хочешь другой тон.
-STYLE = (
-    "Живой, чуть неформальный тон для молодой аудитории, без канцелярита и кликбейта. "
-    "Пиши коротко и по делу."
-)
-
-# Мёртвая ссылка не ломает бота: такие ленты просто пропускаются.
-FEEDS = [
-    # игры
-    ("игры", "https://stopgame.ru/rss/rss_news.xml"),
-    ("игры", "https://www.playground.ru/rss/news.xml"),
-    ("игры", "https://www.pcgamer.com/rss/"),
-    ("игры", "https://www.gamespot.com/feeds/news/"),
-    ("игры", "https://www.ign.com/rss/v2/articles/feed"),
-    # нейросети
-    ("нейросети", "https://habr.com/ru/rss/hubs/artificial_intelligence/articles/?fl=ru"),
-    ("нейросети", "https://techcrunch.com/category/artificial-intelligence/feed/"),
-    ("нейросети", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
-    ("нейросети", "https://venturebeat.com/category/ai/feed/"),
-]
 
 
 def load_state():
@@ -101,7 +99,6 @@ def collect():
 
 
 def fetch_article(url):
-    """Достаём текст статьи и картинку (og:image) прямо со страницы."""
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
@@ -124,44 +121,51 @@ def fetch_article(url):
 
 
 def rewrite(item, article_text):
-    """Gemini превращает новость в аккуратный пост (JSON)."""
-    if not GEMINI_KEY:
+    """Groq генерирует пост с контекстом и шуткой."""
+    if not GROQ_KEY:
         return None
+
     source_text = article_text or item["summary"]
+    
+    # Обновленный промпт: просим больше контекста и шутку в конце
     prompt = (
-        "Ты редактор Telegram-канала про игры и нейросети. "
+        "Ты редактор крутого Telegram-канала про игры и нейросети. "
         f"Стиль: {STYLE}\n"
-        "Сделай из новости пост на русском. Верни JSON с полями:\n"
+        "Твоя задача — сделать из этой новости интересный пост на русском языке. "
+        "Верни строго JSON с полями:\n"
         '"emoji": один подходящий эмодзи по теме,\n'
         '"title": цепляющий заголовок до 80 символов,\n'
-        '"lead": главная суть в 1–2 предложениях, до 250 символов,\n'
-        '"points": список из 2–3 коротких ключевых фактов, каждый до 90 символов,\n'
-        '"hashtags": 2–3 хэштега без символа #.\n'
+        '"context": подробный контекст (2-3 предложения), объясни суть новости, предысторию или почему это важно. До 400 символов,\n'
+        '"points": список из 2-3 коротких ключевых фактов (каждый до 90 символов),\n'
+        '"joke": короткая шутка, ироничный комментарий или мем в тему новости. Если новость серьезная (трагедия, скандал), сделай шутку сдержанной и саркастичной, но не глупой. До 150 символов,\n'
+        '"hashtags": 2-3 хэштега без символа #.\n'
         "Ничего не выдумывай, используй только факты из текста. Без markdown.\n\n"
         f"Заголовок: {item['title']}\nТекст: {source_text}"
     )
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
-    )
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.1-8b-instant", # Или используй llama-3.3-70b-versatile для более умных шуток
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.8 # Чуть повысил температуру, чтобы шутки были креативнее
+    }
+
     try:
-        r = requests.post(
-            url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json"},
-            },
-            timeout=60,
-        )
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
-        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
         raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
         data = json.loads(raw)
-        if not data.get("title") or not data.get("lead"):
+        if not data.get("title") or not data.get("context"):
             return None
         return data
     except Exception as ex:
-        print("gemini failed:", ex)
+        print("groq failed:", ex)
         return None
 
 
@@ -182,12 +186,19 @@ def build_post(item, ai, with_points=True):
         return "\n".join(lines)
 
     icon = ai.get("emoji") or default_icon
-    lines = [f"{icon} <b>{esc(str(ai['title']))}</b>", "", esc(str(ai["lead"]))]
+    # Добавляем контекст
+    lines = [f"{icon} <b>{esc(str(ai['title']))}</b>", "", esc(str(ai["context"]))]
 
+    # Добавляем факты
     points = [str(p) for p in (ai.get("points") or [])][:3]
     if with_points and points:
         lines += [""] + [f"▪️ {esc(p)}" for p in points]
 
+    # Добавляем шутку
+    if ai.get("joke"):
+        lines += ["", f"😅 <i>{esc(str(ai['joke']))}</i>"]
+
+    # Добавляем теги
     tags = []
     base = BASE_TAGS.get(item["topic"])
     if base:
@@ -250,7 +261,7 @@ def main():
     fresh.sort(key=lambda i: i["time"], reverse=True)
     batch = fresh[:MAX_PER_RUN]
 
-    for item in reversed(batch):  # старые первыми
+    for item in reversed(batch):
         article_text, img = fetch_article(item["link"])
         ai = rewrite(item, article_text)
         if send_post(item, ai, img):
