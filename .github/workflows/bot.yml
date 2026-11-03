@@ -27,6 +27,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHANNEL: ${{ secrets.TG_CHANNEL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TEST_RUN: "true"
 
       - name: save state
         run: |
