@@ -19,8 +19,9 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MAX_PER_RUN = 3      
 MAX_AGE_HOURS = 12   
 STATE_FILE = "posted.json"
+CUSTOM_FILE = "custom_news.txt"
 
-BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети", "github": "#github"}
+BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети", "github": "#github", "custom": "#эксклюзив", "thought": "#мысли"}
 
 FEEDS = [
     ("игры", "https://stopgame.ru/rss/rss_news.xml"),
@@ -34,7 +35,6 @@ FEEDS = [
     ("нейросети", "https://3dnews.ru/news/rss/"),
     ("нейросети", "https://www.ixbt.com/export/news.rss"),
     ("нейросети", "https://techcrunch.com/category/artificial-intelligence/feed/"),
-    ("нейросети", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
     ("reddit", "https://www.reddit.com/r/gaming+pcgaming+GTA6+artificial+OpenAI+StableDiffusion/hot/.rss"),
 ]
 
@@ -60,6 +60,58 @@ def entry_time(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
     return calendar.timegm(t) if t else None
 
+# === ЭКСКЛЮЗИВНЫЕ НОВОСТИ (ИЗ ФАЙЛА) ===
+def get_custom_news():
+    try:
+        with open(CUSTOM_FILE, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+            if len(text) > 20: 
+                return {
+                    "id": f"custom_{time.time()}", "link": "https://t.me/PloxiQNews",
+                    "title": text[:50] + "...", "summary": text, "time": time.time(), "topic": "custom"
+                }
+    except FileNotFoundError:
+        pass
+    return None
+
+def clear_custom_news():
+    try:
+        with open(CUSTOM_FILE, "w", encoding="utf-8") as f:
+            f.write("")
+    except Exception:
+        pass
+
+# === ГЕНЕРАЦИЯ ПОСТА-МЫСЛИ ===
+def generate_thought():
+    """Просит ИИ придумать пост не про новости (вопрос, мысль или шутку)"""
+    prompt = (
+        "Ты — автор крутого Telegram-канала про игры и нейросети. "
+        "Напиши короткий пост (2-3 предложения), который не является новостью. "
+        "Это может быть: вопрос к подписчикам, интересная мысль о будущем игр/ИИ, или шутка на тему гейминга. "
+        "Твоя цель — завязать дискуссию или просто поднять настроение. "
+        "Верни строго JSON:\n"
+        '{\n'
+        '  "emoji": "1 эмодзи",\n'
+        '  "title": "Короткий заголовок (до 50 символов)",\n'
+        '  "body": "Текст поста (2-3 предложения)",\n'
+        '  "hashtags": ["тег1", "тег2"],\n'
+        '  "image_prompt": "Промпт на английском для генерации картинки"\n'
+        "}"
+    )
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "temperature": 0.8}
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=45)
+        r.raise_for_status()
+        raw = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip(), flags=re.M).strip()
+        return json.loads(raw)
+    except Exception as ex:
+        print("thought generation failed:", ex)
+        return None
+
+# === GITHUB ===
 def get_github_trending():
     try:
         url = "https://api.github.com/search/repositories"
@@ -84,6 +136,7 @@ def get_github_media(repo_full_name):
         pass
     return None
 
+# === ПАРСИНГ ТГ ===
 def fetch_from_telegram(channel_name):
     items = []
     try:
@@ -109,6 +162,9 @@ def fetch_from_telegram(channel_name):
 
 def collect():
     items = []
+    custom = get_custom_news()
+    if custom: items.append(custom)
+
     for topic, url in FEEDS:
         try:
             feed = feedparser.parse(url, agent="Mozilla/5.0")
@@ -136,6 +192,7 @@ def collect():
     return items
 
 def fetch_article(url):
+    if url == "https://t.me/PloxiQNews": return "", None
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         r.raise_for_status()
@@ -158,45 +215,27 @@ def rewrite(item, article_text):
         f"Ты — топовый SMM-редактор Telegram-канала про игры и нейросети. Твоя задача — делать сочные, короткие посты.\n"
         f"Заголовок новости: {item['title']}\n"
         f"Исходный текст: {source_text}\n\n"
-        
-        "ПРАВИЛА (ОБЯЗАТЕЛЬНЫ К ИСПОЛНЕНИЮ):\n"
-        "1. НИКАКИХ ЦИТАТ ИЗ ИСХОДНОГО ТЕКСТА. Перескажи суть своими словами.\n"
-        "2. Пиши простым, живым языком (как для друзей). НИКАКИХ сложных философских терминов (онтология, семантика и т.д.).\n"
-        "3. Текст (body) должен быть строго 2-3 предложения. Выдели главное.\n"
-        "4. Шутка (joke) должна быть короткой (до 100 символов), понятной и смешной. Если новость серьезная (трагедия, скандал) — оставь поле joke пустым.\n"
-        "5. Если исходный текст — это просто вопрос, мем или скучное обсуждение без фактов, ВЕРНИ ПУСТЫЕ СТРОКИ.\n\n"
-        
-        "Верни ответ СТРОГО в формате JSON (без markdown-разметки и без ```json):\n"
-        "{\n"
-        '  "emoji": "1 эмодзи",\n'
-        '  "title": "Кликбейтный заголовок до 80 символов",\n'
-        '  "body": "Текст поста (2-3 предложения)",\n'
-        '  "joke": "Шутка или пустая строка",\n'
-        '  "hashtags": ["тег1", "тег2"],\n'
-        '  "image_prompt": "Промпт на английском для генерации картинки"\n'
-        "}"
+        "ПРАВИЛА:\n"
+        "1. НИКАКИХ ЦИТАТ. Перескажи суть своими словами.\n"
+        "2. Пиши простым, живым языком. НИКАКИХ сложных терминов.\n"
+        "3. Текст (body) строго 2-3 предложения.\n"
+        "4. Шутка (joke) короткая и понятная. Если новость серьезная — пустая строка.\n"
+        "5. Если исходный текст — вопрос или мем, ВЕРНИ ПУСТЫЕ СТРОКИ.\n"
+        "6. В image_prompt НИКОГДА не используй 'man', 'person', 'face', 'woman'. Только технологии, города или игровые предметы.\n\n"
+        "Верни ответ СТРОГО в формате JSON:\n"
+        '{"emoji": "1 эмодзи", "title": "Заголовок", "body": "Текст", "joke": "Шутка", "hashtags": ["тег1"], "image_prompt": "Промпт"}'
     )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    
-    # ИСПРАВЛЕННАЯ МОДЕЛЬ GROQ
-    payload = {
-        "model": "openai/gpt-oss-120b", 
-        "messages": [{"role": "user", "content": prompt}], 
-        "response_format": {"type": "json_object"}, 
-        "temperature": 0.6
-    }
+    payload = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "temperature": 0.6}
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=45)
         r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"].strip()
-        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip(), flags=re.M).strip()
         data = json.loads(raw)
-        
-        if data.get("title") and data.get("body"): 
-            return data
+        if data.get("title") and data.get("body"): return data
         return None
     except Exception as ex:
         print("groq failed:", ex)
@@ -204,9 +243,21 @@ def rewrite(item, article_text):
 
 def build_post(item, ai):
     esc = html.escape
-    default_icon = "🎮" if item["topic"] == "игры" else "🤖" if item["topic"] == "нейросети" else "💻" if item["topic"] == "github" else "📰"
-    category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ" if item["topic"] == "нейросети" else "ТРЕНДЫ GITHUB" if item["topic"] == "github" else "НОВОСТИ"
-    link = f'<a href="{esc(item["link"], quote=True)}">Читать источник</a>'
+    
+    # Если это "Мысль"
+    if item["topic"] == "thought":
+        category = "МЫСЛИ ВСЛУХ"
+        default_icon = "💭"
+        link = ""
+    # Если это эксклюзив
+    elif item["topic"] == "custom":
+        category = "ЭКСКЛЮЗИВ"
+        default_icon = "🔥"
+        link = "🔥 <b>Наш эксклюзив!</b>"
+    else:
+        default_icon = "🎮" if item["topic"] == "игры" else "🤖" if item["topic"] == "нейросети" else "💻" if item["topic"] == "github" else "📰"
+        category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ" if item["topic"] == "нейросети" else "ТРЕНДЫ GITHUB" if item["topic"] == "github" else "НОВОСТИ"
+        link = f'<a href="{esc(item["link"], quote=True)}">Читать источник</a>'
     
     if not ai: return None 
 
@@ -224,7 +275,8 @@ def build_post(item, ai):
             if f"#{clean_t}" not in tags: tags.append(f"#{clean_t}")
     if tags: lines += ["", " ".join(tags[:4])]
 
-    lines += ["", link, "🤖 <a href='https://t.me/PloxiQNews'>@PloxiQNews</a>"]
+    if link: lines += ["", link]
+    lines += ["", "🤖 <a href='https://t.me/PloxiQNews'>@PloxiQNews</a>"]
     return "\n".join(lines)
 
 def send_post(item, ai, img):
@@ -253,17 +305,30 @@ def main():
     seen = load_state()
     items = collect()
     
-    fresh = [i for i in items if i["id"] not in seen and time.time() - i["time"] < MAX_AGE_HOURS * 3600]
-    random.shuffle(fresh)
+    fresh_others = [i for i in items if i["id"] not in seen and time.time() - i["time"] < MAX_AGE_HOURS * 3600 and i["topic"] != "custom"]
+    random.shuffle(fresh_others)
     
-    candidates = fresh[:15] 
+    candidates = fresh_others[:15]
+    if items and items[0]["topic"] == "custom":
+        candidates.insert(0, items[0])
+    
     posted_count = 0
+
+    # ЛОГИКА "МЫСЛЕЙ": 15% шанс, что бот напишет пост-мысль
+    make_thought = random.random() < 0.15
+    if make_thought:
+        print("💭 Решаем написать пост-мысль...")
+        thought_ai = generate_thought()
+        if thought_ai:
+            thought_item = {"topic": "thought", "link": "", "media": None}
+            if send_post(thought_item, thought_ai, None):
+                posted_count += 1
 
     for item in candidates:
         if posted_count >= MAX_PER_RUN: 
             break
 
-        article_text = item["summary"] if item["topic"] in ["github", "новости", "reddit"] else fetch_article(item["link"])[0]
+        article_text = item["summary"] if item["topic"] in ["github", "новости", "reddit", "custom"] else fetch_article(item["link"])[0]
         ai = rewrite(item, article_text)
         
         if not ai:
@@ -286,7 +351,9 @@ def main():
         if send_post(item, ai, item.get("media")):
             seen.append(item["id"])
             posted_count += 1
-            save_state(seen) 
+            save_state(seen)
+            if item["topic"] == "custom":
+                clear_custom_news()
         time.sleep(5)
 
     print(f"За этот час успешно опубликовано: {posted_count}")
