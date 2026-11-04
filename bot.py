@@ -15,6 +15,7 @@ import requests
 TG_TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHANNEL"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+PIXABAY_KEY = os.environ.get("PIXABAY_API_KEY", "")
 
 MAX_PER_RUN = 3      
 MAX_AGE_HOURS = 12   
@@ -60,153 +61,31 @@ def entry_time(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
     return calendar.timegm(t) if t else None
 
-# === ЭКСКЛЮЗИВНЫЕ НОВОСТИ (ИЗ ФАЙЛА) ===
-def get_custom_news():
+# === ПОИСК РЕАЛЬНЫХ ФОТО НА PIXABAY ===
+def fetch_pixabay_image(query):
+    if not PIXABAY_KEY: return None
     try:
-        with open(CUSTOM_FILE, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-            if len(text) > 20: 
-                return {
-                    "id": f"custom_{time.time()}", "link": "https://t.me/PloxiQNews",
-                    "title": text[:50] + "...", "summary": text, "time": time.time(), "topic": "custom"
-                }
-    except FileNotFoundError:
-        pass
-    return None
-
-def clear_custom_news():
-    try:
-        with open(CUSTOM_FILE, "w", encoding="utf-8") as f:
-            f.write("")
-    except Exception:
-        pass
-
-# === ГЕНЕРАЦИЯ ПОСТА-МЫСЛИ ===
-def generate_thought():
-    """Просит ИИ придумать пост не про новости (вопрос, мысль или шутку)"""
-    prompt = (
-        "Ты — автор крутого Telegram-канала про игры и нейросети. "
-        "Напиши короткий пост (2-3 предложения), который не является новостью. "
-        "Это может быть: вопрос к подписчикам, интересная мысль о будущем игр/ИИ, или шутка на тему гейминга. "
-        "Твоя цель — завязать дискуссию или просто поднять настроение. "
-        "Верни строго JSON:\n"
-        '{\n'
-        '  "emoji": "1 эмодзи",\n'
-        '  "title": "Короткий заголовок (до 50 символов)",\n'
-        '  "body": "Текст поста (2-3 предложения)",\n'
-        '  "hashtags": ["тег1", "тег2"],\n'
-        '  "image_prompt": "Промпт на английском для генерации картинки"\n'
-        "}"
-    )
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "temperature": 0.8}
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=45)
+        url = "https://pixabay.com/api/"
+        params = {
+            "key": PIXABAY_KEY,
+            "q": query,
+            "image_type": "photo",
+            "per_page": 3,
+            "safesearch": "true",
+            "order": "popular"
+        }
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
-        raw = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip(), flags=re.M).strip()
-        return json.loads(raw)
+        data = r.json()
+        if data.get("hits"):
+            # Берем случайную из 3-х найденных
+            img = random.choice(data["hits"])
+            return img.get("largeImageURL")
     except Exception as ex:
-        print("thought generation failed:", ex)
-        return None
-
-# === GITHUB ===
-def get_github_trending():
-    try:
-        url = "https://api.github.com/search/repositories"
-        params = {"q": "topic:artificial-intelligence created:>2026-09-01", "sort": "stars", "order": "desc", "per_page": 2}
-        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        r.raise_for_status()
-        return r.json().get("items", [])
-    except Exception:
-        return []
-
-def get_github_media(repo_full_name):
-    try:
-        url = f"https://api.github.com/repos/{repo_full_name}/readme"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return None
-        content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        images = re.findall(r'!\[[^\]]*\]\((https?://[^\s\)]+)\)', content)
-        for img in images:
-            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                return img
-    except Exception:
-        pass
+        print("pixabay failed:", ex)
     return None
 
-# === ПАРСИНГ ТГ ===
-def fetch_from_telegram(channel_name):
-    items = []
-    try:
-        url = f"https://t.me/s/{channel_name}"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return items
-        messages = re.findall(r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>', r.text, re.S)
-        links = re.findall(r'data-post="([^"]+)"', r.text)
-        images = re.findall(r'background-image:url\(\'([^\']+)\'\)', r.text)
-
-        for i in range(min(len(messages), len(links))):
-            text = clean(messages[i])
-            link = f"https://t.me/{links[i]}"
-            if len(text) > 100: 
-                items.append({
-                    "id": link, "link": link, "title": text[:80] + "...",
-                    "summary": text[:1500], "time": time.time(), "topic": "новости",
-                    "media": images[i] if i < len(images) else None
-                })
-    except Exception:
-        pass
-    return items
-
-def collect():
-    items = []
-    custom = get_custom_news()
-    if custom: items.append(custom)
-
-    for topic, url in FEEDS:
-        try:
-            feed = feedparser.parse(url, agent="Mozilla/5.0")
-            for e in feed.entries[:7]:
-                link = e.get("link")
-                title = clean(e.get("title"))
-                if link and title:
-                    items.append({
-                        "id": e.get("id") or link, "link": link, "title": title,
-                        "summary": clean(e.get("summary"))[:1500], "time": entry_time(e) or time.time(), "topic": topic,
-                    })
-        except Exception:
-            pass
-            
-    for repo in get_github_trending():
-        items.append({
-            "id": f"github_{repo['id']}", "link": repo["html_url"], "title": repo["name"],
-            "summary": repo.get("description") or "Описание отсутствует", "time": time.time(), "topic": "github",
-            "media": get_github_media(repo["full_name"])
-        })
-        
-    for ch in TG_CHANNELS:
-        items.extend(fetch_from_telegram(ch))
-        
-    return items
-
-def fetch_article(url):
-    if url == "https://t.me/PloxiQNews": return "", None
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        r.raise_for_status()
-        page = r.text
-    except Exception:
-        return "", None
-    img = None
-    m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page, re.I) or
-         re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page, re.I))
-    if m: img = html.unescape(m.group(1))
-    paras = re.findall(r"<p[^>]*>(.*?)</p>", page, re.S | re.I)
-    text = " ".join(p for p in (clean(x) for x in paras) if len(p) > 60)
-    return text[:4000], img
-
+# === ГЕНЕРАЦИЯ ТЕКСТА (СТРОГИЙ ПРОМПТ) ===
 def rewrite(item, article_text):
     if not GROQ_KEY: return None
     source_text = article_text or item["summary"]
@@ -244,12 +123,10 @@ def rewrite(item, article_text):
 def build_post(item, ai):
     esc = html.escape
     
-    # Если это "Мысль"
     if item["topic"] == "thought":
         category = "МЫСЛИ ВСЛУХ"
         default_icon = "💭"
         link = ""
-    # Если это эксклюзив
     elif item["topic"] == "custom":
         category = "ЭКСКЛЮЗИВ"
         default_icon = "🔥"
@@ -283,16 +160,27 @@ def send_post(item, ai, img):
     text = build_post(item, ai)
     if not text: return False
 
+    # 1. Если картинка уже есть (из GitHub/TG/Reddit) - используем её
     if item.get("media"): img = item["media"]
     
+    # 2. Если нет - ищем реальное фото на Pixabay по ключевым словам
     if not img or not img.startswith("http"):
-        prompt = ai.get("image_prompt", "gaming setup neon")
-        img = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1080&height=720&nologo=true&seed={random.randint(1, 99999)}"
+        query = ai.get("image_prompt", "gaming")
+        # Очищаем промпт от лишних слов для поиска
+        query = re.sub(r"(8k|unreal engine|cinematic lighting|hyper-detailed|masterpiece)", "", query, flags=re.I).strip()
+        img = fetch_pixabay_image(query)
+        if img: print(f"Pixabay нашел фото по запросу: {query}")
+
+    # 3. Если Pixabay ничего не нашел - генерируем через Pollinations
+    if not img or not img.startswith("http"):
+        prompt = ai.get("image_prompt", "futuristic gaming setup, 8k resolution")
+        img = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1080&height=720&nologo=true&seed={random.randint(1, 99999)}&model=flux"
+        print("Pixabay не нашел, генерируем через Pollinations...")
 
     if len(text) > 1000: text = text[:990] + "..."
 
     try:
-        img_data = requests.get(img, headers={"User-Agent": "Mozilla/5.0"}, timeout=15).content
+        img_data = requests.get(img, headers={"User-Agent": "Mozilla/5.0"}, timeout=20).content
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": CHAT_ID, "caption": text, "parse_mode": "HTML"}, files={"photo": img_data}, timeout=30)
         if r.ok: return True
     except Exception:
@@ -314,7 +202,6 @@ def main():
     
     posted_count = 0
 
-    # ЛОГИКА "МЫСЛЕЙ": 15% шанс, что бот напишет пост-мысль
     make_thought = random.random() < 0.15
     if make_thought:
         print("💭 Решаем написать пост-мысль...")
