@@ -1,30 +1,52 @@
+#!/usr/bin/env python3
+"""PloxiQ News — бот для Telegram-канала про игры и нейросети."""
+
+import base64
 import calendar
+import hashlib
 import html
+import io
 import json
 import os
+import random
 import re
 import time
-import random
-import base64
-import urllib.parse
-import io
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-# === НАСТРОЙКИ ===
+# ======================= НАСТРОЙКИ =======================
 TG_TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHANNEL"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 PIXABAY_KEY = os.environ.get("PIXABAY_API_KEY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # необязательно, поднимает лимиты API
+TEST_RUN = os.environ.get("TEST_RUN", "false").lower() == "true"
 
-MAX_PER_RUN = 3      
-MAX_AGE_HOURS = 12   
+BRAND = "PloxiQ News"
+CHANNEL_URL = "https://t.me/PloxiQNews"
+CHANNEL_HANDLE = "t.me/PloxiQNews"
+
+MAX_PER_RUN = 3
+MAX_AGE_HOURS = 12
 STATE_FILE = "posted.json"
 CUSTOM_FILE = "custom_news.txt"
 
-DEFAULT_IMAGE = "https://image.pollinations.ai/prompt/dark%20gaming%20setup%20neon%20red%20and%20blue?width=1080&height=720&nologo=true&model=flux"
+GROQ_MODELS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]  # вторая — запасная
+CAPTION_LIMIT = 1000        # у Telegram лимит подписи 1024 символа
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_VIDEO_BYTES = 45 * 1024 * 1024  # бот может загрузить до 50 МБ
+
+FONT_DIR = "assets"
+FONT_PATH = os.path.join(FONT_DIR, "Montserrat.ttf")
+FONT_URL = "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf"
+FALLBACK_FONTS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
 
 FEEDS = [
     ("игры", "https://stopgame.ru/rss/rss_news.xml"),
@@ -41,105 +63,304 @@ FEEDS = [
     ("reddit", "https://www.reddit.com/r/gaming+pcgaming+GTA6+artificial+OpenAI/hot/.rss"),
     ("мемы", "https://www.reddit.com/r/memes+ProgrammerHumor+gamingmemes/hot/.rss"),
 ]
-
 TG_CHANNELS = ["dtf_ru", "igromania"]
 
+# Темы, у которых текст и картинка берутся прямо из ленты (без загрузки статьи)
+NO_ARTICLE_TOPICS = {"github", "новости", "reddit", "custom", "мемы"}
+
+# emoji, подпись, хэштег, текст ссылки (None — без ссылки)
+TOPIC_META = {
+    "игры": ("🎮", "ИГРОВЫЕ НОВОСТИ", "#игры", "Читать источник"),
+    "нейросети": ("🤖", "НЕЙРОСЕТИ", "#нейросети", "Читать источник"),
+    "github": ("💻", "ТРЕНДЫ GITHUB", "#github", "Открыть репозиторий"),
+    "reddit": ("🔥", "С REDDIT", "#reddit", "Источник"),
+    "мемы": ("😂", "МЕМ", "#мемы", None),
+    "новости": ("📰", "НОВОСТИ", "#новости", "Источник"),
+    "custom": ("🔥", "ЭКСКЛЮЗИВ", "#эксклюзив", None),
+}
+
+UA = "Mozilla/5.0 (compatible; PloxiQBot/1.0; +https://t.me/PloxiQNews)"
+session = requests.Session()
+session.headers.update({"User-Agent": UA, "Accept-Language": "ru,en;q=0.8"})
+
+
+# ======================= УТИЛИТЫ =======================
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, list) else []
     except Exception:
         return []
+
 
 def save_state(seen):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(seen[-1000:], f, ensure_ascii=False)
+
 
 def clean(text):
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
 
+
+def strip_tags(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", text or ""))
+
+
+def visible_len(text):
+    return len(strip_tags(text))
+
+
 def entry_time(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
-    return calendar.timegm(t) if t else None
-
-# === НАЛОЖЕНИЕ ВОДЯНОГО ЗНАКА ===
-def add_watermark(image_bytes, text="PloxiQ News"):
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        width, height = img.size
-        
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        
-        try:
-            font_url = "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto-Bold.ttf"
-            font_data = requests.get(font_url, timeout=10).content
-            font = ImageFont.truetype(io.BytesIO(font_data), int(height * 0.06))
-        except:
-            font = ImageFont.load_default()
+        return calendar.timegm(t) if t else None
+    except Exception:
+        return None
 
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        
-        padding = int(height * 0.02)
-        x = (width - text_width) / 2
-        y = height - text_height - (padding * 3)
-        
-        # Рисуем красную полупрозрачную плашку
-        draw.rectangle([(0, y - padding), (width, height)], fill=(200, 20, 20, 180))
-        
-        # Рисуем текст с обводкой
-        draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), stroke_width=3, stroke_fill=(0, 0, 0, 255))
-        
-        out = Image.alpha_composite(img, overlay).convert("RGB")
-        out_bytes = io.BytesIO()
-        out.save(out_bytes, format="JPEG", quality=95)
-        return out_bytes.getvalue()
+
+def media_ext(url):
+    return os.path.splitext(urlparse(url).path)[1].lower()
+
+
+def is_direct_video(url):
+    return bool(url) and media_ext(url) in (".mp4", ".webm", ".mov")
+
+
+def download(url, max_bytes, want_video=False):
+    """Скачивает файл с ограничением размера. Бросает исключение при проблемах."""
+    with session.get(url, timeout=(10, 40), stream=True) as r:
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "").lower()
+        if want_video and not (ctype.startswith("video/") or "octet-stream" in ctype):
+            raise ValueError(f"не видео: {ctype}")
+        if int(r.headers.get("Content-Length") or 0) > max_bytes:
+            raise ValueError("файл слишком большой")
+        buf = bytearray()
+        for chunk in r.iter_content(65536):
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                raise ValueError("файл слишком большой")
+        return bytes(buf)
+
+
+# ======================= ВОДЯНОЙ ЗНАК =======================
+_font_download_tried = False
+
+
+def get_font(size):
+    """Montserrat Bold (кэшируется в assets/), затем системные шрифты, затем дефолтный."""
+    global _font_download_tried
+    if not os.path.exists(FONT_PATH) and not _font_download_tried:
+        _font_download_tried = True
+        try:
+            r = requests.get(FONT_URL, timeout=15)
+            r.raise_for_status()
+            if len(r.content) > 50_000:
+                os.makedirs(FONT_DIR, exist_ok=True)
+                with open(FONT_PATH, "wb") as f:
+                    f.write(r.content)
+        except Exception as e:
+            print("Font download failed:", e)
+
+    if os.path.exists(FONT_PATH):
+        try:
+            font = ImageFont.truetype(FONT_PATH, size)
+            try:
+                font.set_variation_by_name("Bold")
+            except Exception:
+                try:
+                    font.set_variation_by_axes([700])
+                except Exception:
+                    pass
+            return font
+        except Exception as e:
+            print("Montserrat load failed:", e)
+
+    for path in FALLBACK_FONTS:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def add_watermark(image_bytes, text=BRAND):
+    """Мягкий тёмный градиент снизу + акцентная полоска + логотип-текст."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((1280, 1280))
+        w, h = img.size
+        base = img.convert("RGBA")
+
+        # --- градиент снизу ---
+        grad_h = max(60, int(h * 0.28))
+        grad = Image.new("L", (1, grad_h))
+        grad.putdata([int(185 * (i / (grad_h - 1)) ** 1.7) for i in range(grad_h)])
+        grad = grad.resize((w, grad_h))
+        shade = Image.new("RGBA", (w, grad_h), (6, 8, 16, 255))
+        shade.putalpha(grad)
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        overlay.paste(shade, (0, h - grad_h))
+
+        # --- размеры ---
+        font_size = max(18, int(w * 0.042))
+        font = get_font(font_size)
+        small = get_font(max(11, int(font_size * 0.5)))
+        margin = int(w * 0.035)
+        baseline = h - margin - int(font_size * 0.25)
+
+        text_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        shadow_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        td = ImageDraw.Draw(text_layer)
+        sd = ImageDraw.Draw(shadow_layer)
+
+        bar_w = max(4, int(font_size * 0.14))
+        bbox = td.textbbox((0, 0), text, font=font, anchor="ls")
+        top, bottom = baseline + bbox[1], baseline + bbox[3]
+        td.rounded_rectangle(
+            [margin, top, margin + bar_w, bottom], radius=bar_w // 2, fill=(255, 64, 75, 240)
+        )
+
+        x = margin + bar_w + int(font_size * 0.4)
+        parts = text.split(" ", 1)
+        first, second = parts[0], parts[1] if len(parts) > 1 else ""
+        space = td.textlength(" ", font=font)
+        sd.text((x + 2, baseline + 2), first, font=font, fill=(0, 0, 0, 170), anchor="ls")
+        td.text((x, baseline), first, font=font, fill=(255, 255, 255, 235), anchor="ls")
+        x2 = x + td.textlength(first, font=font) + space
+        if second:
+            sd.text((x2 + 2, baseline + 2), second, font=font, fill=(0, 0, 0, 170), anchor="ls")
+            td.text((x2, baseline), second, font=font, fill=(255, 70, 80, 235), anchor="ls")
+            x_end = x2 + td.textlength(second, font=font)
+        else:
+            x_end = x2
+
+        # --- ссылка справа (если помещается) ---
+        handle_w = td.textlength(CHANNEL_HANDLE, font=small)
+        if w - margin - handle_w > x_end + margin:
+            td.text(
+                (w - margin, baseline), CHANNEL_HANDLE, font=small,
+                fill=(255, 255, 255, 150), anchor="rs",
+            )
+
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(max(2, font_size * 0.07)))
+        out = Image.alpha_composite(base, overlay)
+        out = Image.alpha_composite(out, shadow_layer)
+        out = Image.alpha_composite(out, text_layer).convert("RGB")
+
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG", quality=92, optimize=True)
+        return buf.getvalue()
     except Exception as e:
         print("Watermark failed:", e)
-        return image_bytes
+        # Если картинка битая — вернуть None, чтобы бот взял следующую
+        try:
+            Image.open(io.BytesIO(image_bytes)).verify()
+            return image_bytes
+        except Exception:
+            return None
 
+
+def make_fallback_cover():
+    """Своя обложка, если ни одну картинку достать не удалось (не зависит от интернета)."""
+    w, h = 1280, 720
+    grad = Image.linear_gradient("L").resize((w, h))
+    img = ImageOps.colorize(grad, black=(10, 12, 28), white=(70, 16, 42)).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+# ======================= ИСТОЧНИКИ =======================
 def fetch_pixabay_image(query):
-    if not PIXABAY_KEY: return None
+    if not PIXABAY_KEY:
+        return None
     try:
-        url = "https://pixabay.com/api/"
-        params = {"key": PIXABAY_KEY, "q": query, "image_type": "photo", "per_page": 3, "safesearch": "true", "order": "popular"}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(
+            "https://pixabay.com/api/",
+            params={
+                "key": PIXABAY_KEY, "q": query[:100], "image_type": "photo",
+                "per_page": 5, "safesearch": "true", "order": "popular",
+            },
+            timeout=10,
+        )
         r.raise_for_status()
-        data = r.json()
-        if data.get("hits"):
-            return random.choice(data["hits"]).get("largeImageURL")
-    except Exception as ex:
-        pass
-    return None
+        hits = r.json().get("hits") or []
+        urls = [h.get("largeImageURL") for h in hits if h.get("largeImageURL")]
+        return random.choice(urls) if urls else None
+    except Exception as e:
+        print("Pixabay failed:", e)
+        return None
+
+
+def github_headers():
+    h = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
 
 def get_github_media(repo_full_name):
     try:
-        url = f"https://api.github.com/repos/{repo_full_name}/readme"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return None
-        content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        images = re.findall(r'!\[[^\]]*\]\((https?://[^\s\)]+)\)', content)
-        images += re.findall(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', content)
-        for img in images:
-            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                return img
+        r = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/readme",
+            headers=github_headers(), timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        content = base64.b64decode(r.json()["content"]).decode("utf-8", "ignore")
+        urls = re.findall(r"!\[[^\]]*\]\((https?://[^\s\)]+)\)", content)
+        urls += re.findall(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', content)
+        for u in urls:
+            low = u.lower()
+            if "shields.io" in low or "badge" in low:
+                continue
+            if media_ext(u) in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                return u
     except Exception:
         pass
     return None
+
+
+def get_github_trending():
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        r = requests.get(
+            "https://api.github.com/search/repositories",
+            params={
+                "q": f"topic:artificial-intelligence created:>{since}",
+                "sort": "stars", "order": "desc", "per_page": 2,
+            },
+            headers=github_headers(), timeout=15,
+        )
+        r.raise_for_status()
+        return r.json().get("items", [])
+    except Exception as e:
+        print("GitHub trending failed:", e)
+        return []
+
 
 def get_custom_news():
     try:
         with open(CUSTOM_FILE, "r", encoding="utf-8") as f:
             text = f.read().strip()
-            if len(text) > 20: 
-                return {"id": f"custom_{time.time()}", "link": "https://t.me/PloxiQNews", "title": text[:50] + "...", "summary": text, "time": time.time(), "topic": "custom"}
     except FileNotFoundError:
-        pass
-    return None
+        return None
+    if len(text) <= 20:
+        return None
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+    return {
+        "id": f"custom_{digest}", "link": CHANNEL_URL, "title": text[:50] + "...",
+        "summary": text, "time": time.time(), "topic": "custom", "media": None,
+    }
+
 
 def clear_custom_news():
     try:
@@ -148,250 +369,184 @@ def clear_custom_news():
     except Exception:
         pass
 
-def generate_thought():
-    prompt = (
-        "Ты — автор крутого Telegram-канала про игры и нейросети. "
-        "Напиши короткий пост (2-3 предложения), который не является новостью (вопрос к подписчикам или мысль). "
-        "Верни строго JSON:\n"
-        '{"emoji": "1 эмодзи", "title": "Короткий заголовок", "body": "Текст", "hashtags": [], "image_prompt": "Промпт"}'
-    )
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "temperature": 0.8}
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=45)
-        r.raise_for_status()
-        raw = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip(), flags=re.M).strip()
-        return json.loads(raw)
-    except Exception as ex:
-        return None
-
-def get_github_trending():
-    try:
-        url = "https://api.github.com/search/repositories"
-        params = {"q": "topic:artificial-intelligence created:>2026-09-01", "sort": "stars", "order": "desc", "per_page": 2}
-        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        r.raise_for_status()
-        return r.json().get("items", [])
-    except Exception:
-        return []
 
 def fetch_from_telegram(channel_name):
     items = []
     try:
-        url = f"https://t.me/s/{channel_name}"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return items
-        messages = re.findall(r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>', r.text, re.S)
-        links = re.findall(r'data-post="([^"]+)"', r.text)
-        images = re.findall(r'background-image:url\(\'([^\']+)\'\)', r.text)
-
-        for i in range(min(len(messages), len(links))):
-            text = clean(messages[i])
-            link = f"https://t.me/{links[i]}"
-            if len(text) > 100: 
-                items.append({"id": link, "link": link, "title": text[:80] + "...", "summary": text[:1500], "time": time.time(), "topic": "новости", "media": images[i] if i < len(images) else None})
-    except Exception:
-        pass
+        r = session.get(f"https://t.me/s/{channel_name}", timeout=15)
+        if r.status_code != 200:
+            return items
+        blocks = re.split(r'(?=<div class="tgme_widget_message_wrap)', r.text)
+        for block in blocks:
+            post = re.search(r'data-post="([^"]+)"', block)
+            msg = re.search(r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>', block, re.S)
+            if not post or not msg:
+                continue
+            text = clean(msg.group(1))
+            if len(text) <= 100:
+                continue
+            photo = re.search(
+                r"tgme_widget_message_photo_wrap[^>]*background-image:url\('([^']+)'\)", block
+            )
+            when = re.search(r'<time[^>]+datetime="([^"]+)"', block)
+            ts = time.time()
+            if when:
+                try:
+                    ts = datetime.fromisoformat(when.group(1)).timestamp()
+                except ValueError:
+                    pass
+            link = f"https://t.me/{post.group(1)}"
+            items.append({
+                "id": link, "link": link, "title": text[:80] + "...", "summary": text[:1500],
+                "time": ts, "topic": "новости", "media": photo.group(1) if photo else None,
+            })
+    except Exception as e:
+        print(f"Telegram {channel_name} failed:", e)
     return items
+
+
+def reddit_media(summary_html):
+    m = re.search(r'href=["\'](https?://i\.redd\.it/[^"\']+)["\']', summary_html or "")
+    if m:
+        return html.unescape(m.group(1))
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary_html or "")
+    return html.unescape(m.group(1)) if m else None
+
 
 def collect():
     items = []
     custom = get_custom_news()
-    if custom: items.append(custom)
+    if custom:
+        items.append(custom)
 
     for topic, url in FEEDS:
         try:
-            feed = feedparser.parse(url, agent="Mozilla/5.0")
+            r = session.get(url, timeout=15)
+            r.raise_for_status()
+            feed = feedparser.parse(r.content)
             for e in feed.entries[:7]:
-                link = e.get("link")
-                title = clean(e.get("title"))
-                if link and title:
-                    media = None
-                    if topic == "мемы":
-                        img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', e.get("summary", ""))
-                        if img_match: media = img_match.group(1)
-                    
-                    items.append({"id": e.get("id") or link, "link": link, "title": title, "summary": clean(e.get("summary"))[:1500], "time": entry_time(e) or time.time(), "topic": topic, "media": media})
-        except Exception:
-            pass
-            
+                link, title = e.get("link"), clean(e.get("title"))
+                if not (link and title):
+                    continue
+                raw_summary = e.get("summary", "")
+                media = reddit_media(raw_summary) if topic in ("мемы", "reddit") else None
+                items.append({
+                    "id": e.get("id") or link, "link": link, "title": title,
+                    "summary": clean(raw_summary)[:1500],
+                    "time": entry_time(e) or time.time(), "topic": topic, "media": media,
+                })
+        except Exception as e:
+            print(f"Feed failed {url}:", e)
+
     for repo in get_github_trending():
-        items.append({"id": f"github_{repo['id']}", "link": repo["html_url"], "title": repo["name"], "summary": repo.get("description") or "Описание отсутствует", "time": time.time(), "topic": "github", "media": get_github_media(repo["full_name"])})
-        
+        items.append({
+            "id": f"github_{repo['id']}", "link": repo["html_url"], "title": repo["name"],
+            "summary": repo.get("description") or "Описание отсутствует",
+            "time": time.time(), "topic": "github",
+            "media": get_github_media(repo["full_name"]),
+        })
+
     for ch in TG_CHANNELS:
         items.extend(fetch_from_telegram(ch))
-        
-    return items
+
+    # убираем дубликаты по id
+    unique, ids = [], set()
+    for it in items:
+        if it["id"] not in ids:
+            ids.add(it["id"])
+            unique.append(it)
+    return unique
+
+
+def meta_content(page, *props):
+    for p in props:
+        name = re.escape(p)
+        for pat in (
+            rf'<meta[^>]+(?:property|name)=["\']{name}["\'][^>]+content=["\']([^"\']+)',
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{name}["\']',
+        ):
+            m = re.search(pat, page, re.I)
+            if m:
+                return html.unescape(m.group(1)).strip()
+    return None
+
 
 def fetch_article(url):
-    if url == "https://t.me/PloxiQNews": return "", None, None
+    """Возвращает (текст, картинка, прямое_видео)."""
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = session.get(url, timeout=12)
         r.raise_for_status()
+        if r.encoding in (None, "ISO-8859-1"):
+            r.encoding = r.apparent_encoding
         page = r.text
     except Exception:
         return "", None, None
-    
-    img = None
-    m_img = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', page, re.I) or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', page, re.I))
-    if m_img: img = html.unescape(m_img.group(1))
 
-    video = None
-    m_vid = (re.search(r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)', page, re.I) or re.search(r'<meta[^>]+property=["\']og:video:url["\'][^>]+content=["\']([^"\']+)', page, re.I))
-    if m_vid: video = html.unescape(m_vid.group(1))
+    img = meta_content(page, "og:image", "og:image:url", "twitter:image")
+    video = meta_content(page, "og:video:secure_url", "og:video", "og:video:url")
+    if img:
+        img = urljoin(url, img)
+    if video:
+        video = urljoin(url, video)
+        if not is_direct_video(video):  # YouTube-эмбеды и плееры отправить нельзя
+            video = None
 
     paras = re.findall(r"<p[^>]*>(.*?)</p>", page, re.S | re.I)
     text = " ".join(p for p in (clean(x) for x in paras) if len(p) > 60)
     return text[:4000], img, video
 
+
+# ======================= GROQ =======================
+def groq_json(prompt, temperature=0.6):
+    if not GROQ_KEY:
+        return None
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    for model in GROQ_MODELS:
+        payload = {
+            "model": model, "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+        }
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers, json=payload, timeout=60,
+                )
+                if r.status_code == 429:
+                    time.sleep(8)
+                    continue
+                r.raise_for_status()
+                raw = r.json()["choices"][0]["message"]["content"]
+                m = re.search(r"\{.*\}", raw, re.S)
+                return json.loads(m.group(0)) if m else None
+            except Exception as e:
+                print(f"Groq {model} failed:", e)
+                break
+    return None
+
+
 def rewrite(item, article_text):
-    if not GROQ_KEY: return None
-    source_text = article_text or item["summary"]
-    
+    source_text = (article_text or item["summary"])[:3500]
     prompt = (
-        f"Ты — топовый SMM-редактор Telegram-канала про игры и нейросети. Твоя задача — делать сочные, короткие посты.\n"
+        "Ты — топовый SMM-редактор Telegram-канала про игры и нейросети. "
+        "Делай сочные, короткие посты.\n"
+        f"Тема: {item['topic']}\n"
         f"Заголовок новости: {item['title']}\n"
         f"Исходный текст: {source_text}\n\n"
         "ПРАВИЛА:\n"
-        "1. НИКАКИХ ЦИТАТ ИЗ ИСХОДНОГО ТЕКСТА. Перескажи суть своими словами.\n"
-        "2. Используй HTML-теги для форматирования: <b>жирный текст</b> для важных слов, <i>курсив</i> для шуток, <blockquote>цитата</blockquote> для выделения главной мысли.\n"
-        "3. Текст (body) строго 2-4 предложения.\n"
-        "4. Шутка (joke) короткая и понятная. Если новость серьезная — пустая строка.\n"
-        "5. Если это мем (topic: мемы) — просто переведи шутку на русский и адаптируй.\n"
-        "6. В image_prompt напиши 2-3 слова на английском для поиска фото.\n\n"
-        "Верни ответ СТРОГО в формате JSON:\n"
-        '{"emoji": "1 эмодзи", "title": "Заголовок (можно с HTML)", "body": "Текст с HTML-тегами", "joke": "Шутка с HTML-тегами", "image_prompt": "Промпт"}'
+        "1. Никаких цитат из исходника — перескажи суть своими словами, по-русски.\n"
+        "2. title — короткий цепляющий заголовок, обычный текст БЕЗ тегов.\n"
+        "3. body — 2-4 предложения. Можно использовать ТОЛЬКО теги <b></b> (1-3 раза "
+        "для ключевых слов) и <i></i>. Никаких других тегов и markdown.\n"
+        "4. quote — одна короткая мысль/вывод до 120 символов, обычный текст, "
+        "не повторяющий body. Если нечего сказать — пустая строка.\n"
+        "5. joke — короткая понятная шутка обычным текстом. Для серьёзных новостей — пустая строка.\n"
+        "6. Если topic = мемы — переведи шутку на русский и адаптируй; quote оставь пустым.\n"
+        "7. image_prompt — 2-3 слова на английском для поиска фото.\n\n"
+        "Верни СТРОГО JSON:\n"
+        '{"emoji": "1 эмодзи", "title": "...", "body": "...", "quote": "...", '
+        '"joke": "...", "image_prompt": "..."}'
     )
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "openai/gpt-oss-120b", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}, "temperature": 0.6}
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=45)
-        r.raise_for_status()
-        raw = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip(), flags=re.M).strip()
-        data = json.loads(raw)
-        if data.get("title") and data.get("body"): return data
-        return None
-    except Exception as ex:
-        print("groq failed:", ex)
-        return None
-
-def build_post(item, ai):
-    esc = html.escape
-    
-    if item["topic"] == "thought": category, default_icon, link = "💭 <b>МЫСЛИ ВСЛУХ</b>", "💭", ""
-    elif item["topic"] == "custom": category, default_icon, link = "🔥 <b>ЭКСКЛЮЗИВ</b>", "🔥", "🔥 <b>Наш эксклюзив!</b>"
-    elif item["topic"] == "мемы": category, default_icon, link = "😂 <b>МЕМ</b>", "😂", ""
-    elif item["topic"] == "github": category, default_icon, link = "💻 <b>ТРЕНДЫ GITHUB</b>", "💻", f'<a href="{esc(item["link"], quote=True)}">Ссылка на репозиторий</a>'
-    elif item["topic"] == "нейросети": category, default_icon, link = "🤖 <b>НЕЙРОСЕТИ</b>", "🤖", f'<a href="{esc(item["link"], quote=True)}">Читать источник</a>'
-    else: category, default_icon, link = "🎮 <b>ИГРОВЫЕ НОВОСТИ</b>", "🎮", f'<a href="{esc(item["link"], quote=True)}">Читать источник</a>'
-    
-    if not ai: return None 
-
-    icon = ai.get("emoji") or default_icon
-    
-    lines = [f"{icon} {category}", "", f"{ai['title']}", "", ai.get("body", "")]
-    
-    if ai.get("joke") and len(str(ai.get("joke"))) > 3: 
-        lines += ["", f"😂 <i>{ai['joke']}</i>"]
-
-    if link: lines += ["", link]
-    
-    # Улучшенная подпись
-    lines += ["", "━━━━━━━━━━━━━━━━━━", "⚡️ <a href='https://t.me/PloxiQNews'><b>PloxiQ News</b></a> | Твой источник гейминга"]
-    
-    return "\n".join(lines)
-
-def send_post(item, ai, media_url):
-    text = build_post(item, ai)
-    if not text: return False
-
-    is_video = False
-    if media_url and media_url.startswith("http"):
-        if media_url.lower().endswith(('.mp4', '.webm', '.mov')):
-            is_video = True
-    else:
-        query = ai.get("image_prompt", "gaming setup")
-        media_url = fetch_pixabay_image(query)
-        if not media_url:
-            media_url = DEFAULT_IMAGE
-
-    if len(text) > 1000: text = text[:990] + "..."
-
-    try:
-        media_data = requests.get(media_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).content
-        
-        if is_video:
-            print("Отправляем видео (без вотермарки)...")
-            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendVideo", data={"chat_id": CHAT_ID, "caption": text, "parse_mode": "HTML"}, files={"video": media_data}, timeout=60)
-        else:
-            print("Накладываем вотермарку и отправляем фото...")
-            media_data_with_wm = add_watermark(media_data, "PloxiQ News")
-            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": CHAT_ID, "caption": text, "parse_mode": "HTML"}, files={"photo": media_data_with_wm}, timeout=30)
-            
-        if r.ok: return True
-        else: print("TG error:", r.text)
-    except Exception as e:
-        print("Media download failed:", e)
-
-    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=30)
-    return r.ok
-
-def main():
-    seen = load_state()
-    items = collect()
-    
-    fresh_others = [i for i in items if i["id"] not in seen and time.time() - i["time"] < MAX_AGE_HOURS * 3600 and i["topic"] != "custom"]
-    random.shuffle(fresh_others)
-    
-    candidates = fresh_others[:15]
-    if items and items[0]["topic"] == "custom":
-        candidates.insert(0, items[0])
-    
-    posted_count = 0
-
-    for item in candidates:
-        if posted_count >= MAX_PER_RUN: 
-            break
-
-        if item["topic"] in ["github", "новости", "reddit", "custom", "мемы"]:
-            article_text = item["summary"]
-            site_media = item.get("media")
-        else:
-            article_text, site_img, site_vid = fetch_article(item["link"])
-            site_media = site_vid if site_vid else site_img
-
-        ai = rewrite(item, article_text)
-        
-        if not ai:
-            continue
-
-        is_test = os.environ.get("TEST_RUN", "false").lower() == "true"
-        
-        if is_test:
-            print("🧪 Тестовый режим...")
-        else:
-            if posted_count == 0:
-                delay = random.randint(0, 600)
-            else:
-                delay = random.randint(600, 2100)
-            
-            if delay > 0:
-                time.sleep(delay)
-
-        if send_post(item, ai, site_media):
-            seen.append(item["id"])
-            posted_count += 1
-            save_state(seen)
-            if item["topic"] == "custom":
-                clear_custom_news()
-        time.sleep(5)
-
-    print(f"За этот час успешно опубликовано: {posted_count}")
-
-if __name__ == "__main__":
-    main()
+    data = groq_json(prompt)
+    i
