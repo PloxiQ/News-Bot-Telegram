@@ -5,6 +5,7 @@ import os
 import re
 import time
 import random
+import base64
 
 import feedparser
 import requests
@@ -18,9 +19,9 @@ MAX_PER_RUN = 1
 MAX_AGE_HOURS = 24   
 STATE_FILE = "posted.json"
 
-BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети"}
+BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети", "github": "#github #opensource"}
 
-# Стиль постов (теперь адаптивный)
+# Стиль постов (адаптивный, без шаблонов)
 STYLE = (
     "Ты профессиональный редактор. Проанализируй новость и сам выбери тон. "
     "Если новость смешная, странная или курьезная — пиши с юмором и иронией. "
@@ -41,7 +42,6 @@ FEEDS = [
 ]
 
 def channel_footer():
-    # Убрали ссылку, так как она вызывает ошибку внутри самого канала
     return ""
 
 def load_state():
@@ -64,12 +64,52 @@ def entry_time(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
     return calendar.timegm(t) if t else None
 
+# === ФУНКЦИИ ДЛЯ GITHUB ===
+def get_github_trending():
+    """Ищет трендовые ИИ-репозитории на GitHub за последний месяц"""
+    try:
+        # Ищем репозитории по теме AI, созданные недавно, сортируем по звездам
+        url = "https://api.github.com/search/repositories"
+        params = {
+            "q": "topic:artificial-intelligence created:>2026-10-01",
+            "sort": "stars",
+            "order": "desc",
+            "per_page": 3
+        }
+        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.raise_for_status()
+        return r.json().get("items", [])
+    except Exception as ex:
+        print("github api failed:", ex)
+        return []
+
+def get_github_media(repo_full_name):
+    """Ищет картинки или гифки в README репозитория"""
+    try:
+        url = f"https://api.github.com/repos/{repo_full_name}/readme"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if r.status_code != 200:
+            return None
+        content = base64.b64decode(r.json()["content"]).decode("utf-8")
+        
+        # Ищем ссылки на картинки/гифки
+        images = re.findall(r'!\[[^\]]*\]\((https?://[^\s\)]+)\)', content)
+        for img in images:
+            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                return img
+    except Exception as ex:
+        print("github readme failed:", ex)
+    return None
+
+# === ОСНОВНЫЕ ФУНКЦИИ ===
 def collect():
     items = []
+    
+    # 1. Собираем новости из RSS
     for topic, url in FEEDS:
         try:
             feed = feedparser.parse(url, agent="Mozilla/5.0")
-            for e in feed.entries[:15]:
+            for e in feed.entries[:10]: # Берем по 10 новостей с каждого сайта
                 link = e.get("link")
                 title = clean(e.get("title"))
                 if not link or not title:
@@ -84,6 +124,20 @@ def collect():
                 })
         except Exception as ex:
             print("feed failed:", url, ex)
+            
+    # 2. Собираем тренды с GitHub
+    repos = get_github_trending()
+    for repo in repos:
+        items.append({
+            "id": f"github_{repo['id']}",
+            "link": repo["html_url"],
+            "title": repo["name"],
+            "summary": repo.get("description") or "Описание отсутствует",
+            "time": time.time(), # Считаем свежими
+            "topic": "github",
+            "media": get_github_media(repo["full_name"]) # Сохраняем найденную картинку
+        })
+        
     return items
 
 def fetch_article(url):
@@ -92,7 +146,6 @@ def fetch_article(url):
         r.raise_for_status()
         page = r.text
     except Exception as ex:
-        print("article fetch failed:", url, ex)
         return "", None
 
     img = None
@@ -112,19 +165,28 @@ def rewrite(item, article_text):
         return None
 
     source_text = article_text or item["summary"]
+    
+    # Если это GitHub, даем особую инструкцию
+    is_github = item["topic"] == "github"
+    github_rule = ""
+    if is_github:
+        github_rule = (
+            "Это репозиторий с GitHub. Расскажи, какую крутую проблему он решает или что умеет. "
+            "ЗАПРЕЩЕНО использовать шаблонные фразы (например: 'На GitHub залетел...', 'Вайбкодеры забираем', 'Сохраняем и покоряем'). "
+            "Придумай уникальный, цепляющий заголовок."
+        )
 
     prompt = (
         "Ты креативный SMM-редактор топового Telegram-канала про игры и нейросети. "
         f"Стиль: {STYLE}\n"
-        "Твоя главная цель — зацепить читателя так, чтобы он дочитал до конца и захотел переслать пост другу. "
-        "НЕ ИСПОЛЬЗУЙ ШАБЛОНЫ! Для каждой новости выбирай свой уникальный подход. "
-        "Ты можешь начать с вопроса, с шокирующего факта, с интриги или просто с короткого абзаца. "
-        "Можешь использовать маркированные списки, а можешь писать сплошным текстом. Реши сам, что лучше подойдет именно для этой новости. "
+        f"{github_rule}\n"
+        "Твоя главная цель — зацепить читателя. НЕ ИСПОЛЬЗУЙ ШАБЛОНЫ! Для каждой новости выбирай свой уникальный подход. "
+        "Можешь начать с вопроса, с шокирующего факта или с короткого абзаца. "
         "Верни строго JSON с полями:\n"
         '"emoji": один подходящий эмодзи по теме,\n'
         '"title": цепляющий, кликбейтный (но правдивый) заголовок до 80 символов,\n'
         '"body": основной текст поста (2-4 предложения или список фактов). Пиши живо, с эмодзи внутри текста, если это уместно. До 500 символов,\n'
-        '"joke": короткая шутка или ироничный вывод в конце. Если новость серьезная (трагедия, скандал) — оставь это поле пустым,\n'
+        '"joke": короткая шутка или ироничный вывод в конце. Если новость серьезная — оставь это поле пустым,\n'
         '"hashtags": 2-3 хэштега без символа #,\n'
         '"image_prompt": короткий промпт на английском для генерации картинки по теме новости.\n'
         "Ничего не выдумывай, используй только факты из текста. Если текст на английском - переведи всё на русский. Без markdown.\n\n"
@@ -155,8 +217,8 @@ def rewrite(item, article_text):
 
 def build_post(item, ai):
     esc = html.escape
-    default_icon = "🎮" if item["topic"] == "игры" else "🤖"
-    category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ"
+    default_icon = "🎮" if item["topic"] == "игры" else "🤖" if item["topic"] == "нейросети" else "💻"
+    category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ" if item["topic"] == "нейросети" else "ТРЕНДЫ GITHUB"
     
     link = f'<a href="{esc(item["link"], quote=True)}">Читать источник</a>'
 
@@ -167,8 +229,6 @@ def build_post(item, ai):
     lines = [f"{icon} <b>{category}</b>", ""]
     lines.append(f"<b>{esc(str(ai['title']))}</b>")
     lines.append("")
-    
-    # Вставляем текст, который придумал ИИ (он сам решил, как его оформить)
     lines.append(esc(str(ai.get("body", ""))))
 
     if ai.get("joke"):
@@ -179,16 +239,15 @@ def build_post(item, ai):
     if base:
         tags.append(base)
     for t in (ai.get("hashtags") or [])[:3]:
-        t = "#" + re.sub(r"\W", "", str(t)).lower()
-        if len(t) > 1 and t not in tags:
-            tags.append(t)
+        clean_t = re.sub(r"[^a-zA-Zа-яА-Я0-9]", "", str(t)).lower()
+        if len(clean_t) >= 3:
+            t = "#" + clean_t
+            if t not in tags:
+                tags.append(t)
     if tags:
         lines += ["", " ".join(tags[:4])]
 
     lines += ["", link]
-    footer = channel_footer()
-    if footer:
-        lines += [footer]
     return "\n".join(lines)
 
 def send_post(item, ai, img):
@@ -196,15 +255,16 @@ def send_post(item, ai, img):
     if not text:
         return False
 
-    # Если нет картинки на сайте, генерируем её через бесплатный Pollinations AI
+    # Если есть картинка из GitHub, используем её. Иначе генерируем.
+    if item["topic"] == "github" and item.get("media"):
+        img = item["media"]
+    
     if not img or not img.startswith("http"):
         prompt = ai.get("image_prompt", "gaming setup neon")
-        # Кодируем промпт для URL
         prompt_encoded = requests.utils.quote(prompt)
         img = f"https://image.pollinations.ai/prompt/{prompt_encoded}?width=1080&height=720&nologo=true&seed={random.randint(1, 99999)}"
         print(f"Генерируем картинку: {img}")
 
-    # Если текст слишком длинный для подписи к фото, обрезаем его
     if len(text) > 1000:
         text = text[:990] + "..."
 
@@ -229,7 +289,7 @@ def send_post(item, ai, img):
     except Exception as e:
         print("Image download/upload failed:", e)
 
-    # Если картинка так и не отправилась, шлем просто текст
+    # Если картинка не ушла, отправляем текст
     r = requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
@@ -246,16 +306,23 @@ def main():
         i for i in items
         if i["id"] not in seen and now - i["time"] < MAX_AGE_HOURS * 3600
     ]
-    fresh.sort(key=lambda i: i["time"], reverse=True)
+    # Перемешиваем, чтобы посты были вперемешку (и игры, и ИИ, и гитхаб)
+    random.shuffle(fresh)
     
-    candidates = fresh[:5] 
+    candidates = fresh[:10] 
     posted_count = 0
 
     for item in candidates:
         if posted_count >= MAX_PER_RUN:
             break
 
-        article_text, img = fetch_article(item["link"])
+        # Для GitHub не нужно парсить статью, берем описание из API
+        if item["topic"] == "github":
+            article_text = item["summary"]
+            img = None
+        else:
+            article_text, img = fetch_article(item["link"])
+            
         ai = rewrite(item, article_text)
         
         if not ai:
@@ -267,7 +334,6 @@ def main():
         if is_test:
             print("🧪 Тестовый режим: публикуем сразу...")
         else:
-            # 80% шанс на быструю публикацию (10-20 мин), 20% - на долгую (1-2 часа)
             if random.random() < 0.8:
                 delay = random.randint(600, 1200) 
             else:
