@@ -548,5 +548,211 @@ def rewrite(item, article_text):
         '{"emoji": "1 эмодзи", "title": "...", "body": "...", "quote": "...", '
         '"joke": "...", "image_prompt": "..."}'
     )
-    data = groq_json(prompt)
-    i
+        data = groq_json(prompt)
+    if isinstance(data, dict) and data.get("title") and data.get("body"):
+        return data
+    return None
+
+ALLOWED_TAGS = {"b", "i", "u", "s", "code", "blockquote"}
+TAG_ALIASES = {"strong": "b", "em": "i", "ins": "u", "strike": "s", "del": "s"}
+TOKEN_RE = re.compile(r"<\s*(/?)\s*([a-zA-Z][a-zA-Z0-9]*)[^>]*>|<[!?][^>]*>|[^<]+|<", re.S)
+
+def sanitize_html(text, max_chars=None):
+    text = re.sub(r"<\s*br\s*/?>", "\n", text or "", flags=re.I)
+    out, stack, count = [], [], 0
+    for m in TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if m.group(2):
+            name = m.group(2).lower()
+            name = TAG_ALIASES.get(name, name)
+            if name not in ALLOWED_TAGS:
+                continue
+            if m.group(1):
+                if name in stack:
+                    while stack:
+                        top = stack.pop()
+                        out.append(f"</{top}>")
+                        if top == name:
+                            break
+            else:
+                stack.append(name)
+                out.append(f"<{name}>")
+        elif tok.startswith("<!") or tok.startswith("<?"):
+            continue
+        else:
+            plain = "<" if tok == "<" else html.unescape(tok)
+            if max_chars is not None and count + len(plain) > max_chars:
+                plain = plain[: max(0, max_chars - count)].rstrip() + "…"
+                out.append(html.escape(plain, quote=False))
+                break
+            out.append(html.escape(plain, quote=False))
+            count += len(plain)
+    while stack:
+        out.append(f"</{stack.pop()}>")
+    result = "".join(out)
+    result = re.sub(r"<(b|i|u|s|code|blockquote)>\s*</\1>", "", result)
+    return result.strip()
+
+def plain_field(value, limit):
+    text = clean(str(value or ""))
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return html.escape(text, quote=False)
+
+def build_post(item, ai):
+    if not ai:
+        return None
+    default_icon, label, hashtag, link_label = TOPIC_META.get(item["topic"], TOPIC_META["игры"])
+
+    icon = str(ai.get("emoji") or "").strip()
+    if not icon or len(icon) > 4:
+        icon = default_icon
+
+    title = plain_field(ai.get("title"), 140)
+    quote = plain_field(ai.get("quote"), 160)
+    joke = plain_field(ai.get("joke"), 140)
+    link = item.get("link", "")
+    link_line = ""
+    if link_label and link.startswith("http"):
+        link_line = f'🔗 <a href="{html.escape(link, quote=True)}">{link_label}</a>'
+    footer = ("▬▬▬▬▬▬▬▬▬▬▬▬\n" f'⚡ <a href="{CHANNEL_URL}"><b>{BRAND}</b></a> · гейминг и нейросети')
+
+    text = ""
+    for body_limit in (700, 560, 440, 320, 220, 140):
+        parts = [f"{icon} <b>{label}</b>", "", f"<b>{title}</b>", "", sanitize_html(ai.get("body", ""), body_limit)]
+        if len(quote) > 3:
+            parts += ["", f"<blockquote>{quote}</blockquote>"]
+        if len(joke) > 3:
+            parts += ["", f"😂 <i>{joke}</i>"]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", hashtag, "", footer]
+        text = "\n".join(parts)
+        if visible_len(text) <= CAPTION_LIMIT:
+            break
+    return text
+
+def tg_call(method, data, files=None, timeout=90):
+    err = "unknown"
+    for _ in range(3):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=data, files=files, timeout=timeout)
+        except requests.RequestException as e:
+            err = str(e)
+            time.sleep(3)
+            continue
+        if r.ok:
+            return True, ""
+        try:
+            info = r.json()
+        except ValueError:
+            info = {}
+        err = info.get("description", r.text[:200])
+        if r.status_code == 429:
+            time.sleep(min(int(info.get("parameters", {}).get("retry_after", 5)), 60))
+            continue
+        break
+    print(f"TG {method} error:", err)
+    return False, err
+
+def send_with_fallback(method, text_key, html_text, extra=None, files=None):
+    data = {"chat_id": CHAT_ID, text_key: html_text, "parse_mode": "HTML", **(extra or {})}
+    ok, err = tg_call(method, data, files)
+    if not ok and "parse entities" in err.lower():
+        data[text_key] = strip_tags(html_text)
+        data.pop("parse_mode")
+        ok, _ = tg_call(method, data, files)
+    return ok
+
+def split_media(url):
+    if not url or not url.startswith("http"):
+        return None, None
+    return (url, None) if is_direct_video(url) else (None, url)
+
+def image_candidates(site_image, query):
+    if site_image:
+        yield site_image
+    px = fetch_pixabay_image(query)
+    if px:
+        yield px
+
+def send_post(item, ai, video_url, image_url):
+    text = build_post(item, ai)
+    if not text:
+        return False
+
+    if video_url:
+        try:
+            data = download(video_url, MAX_VIDEO_BYTES, want_video=True)
+            if send_with_fallback("sendVideo", "caption", text, {"supports_streaming": "true"}, {"video": ("video.mp4", data, "video/mp4")}):
+                return True
+        except Exception as e:
+            print("Video failed:", e)
+
+    query = str(ai.get("image_prompt") or "gaming setup")
+    for url in image_candidates(image_url, query):
+        try:
+            wm = add_watermark(download(url, MAX_IMAGE_BYTES))
+            if not wm:
+                continue
+            if send_with_fallback("sendPhoto", "caption", text, None, {"photo": ("image.jpg", wm, "image/jpeg")}):
+                return True
+        except Exception as e:
+            print("Image failed:", url, e)
+
+    try:
+        wm = add_watermark(make_fallback_cover())
+        if wm and send_with_fallback("sendPhoto", "caption", text, None, {"photo": ("cover.jpg", wm, "image/jpeg")}):
+            return True
+    except Exception as e:
+        print("Cover failed:", e)
+
+    return send_with_fallback("sendMessage", "text", text, {"disable_web_page_preview": "true"})
+
+def main():
+    seen = load_state()
+    seen_set = set(seen)
+    items = collect()
+
+    now = time.time()
+    fresh = [i for i in items if i["id"] not in seen_set and now - i["time"] < MAX_AGE_HOURS * 3600 and i["topic"] != "custom"]
+    random.shuffle(fresh)
+    candidates = fresh[:15]
+    custom = next((i for i in items if i["topic"] == "custom"), None)
+    if custom and custom["id"] not in seen_set:
+        candidates.insert(0, custom)
+
+    posted = 0
+    for item in candidates:
+        if posted >= MAX_PER_RUN:
+            break
+
+        if item["topic"] in NO_ARTICLE_TOPICS:
+            article_text = item["summary"]
+            video_url, image_url = split_media(item.get("media"))
+        else:
+            article_text, image_url, video_url = fetch_article(item["link"])
+
+        ai = rewrite(item, article_text)
+        if not ai:
+            continue
+
+        if TEST_RUN:
+            print("🧪 Тестовый режим, без задержек...")
+        else:
+            delay = random.randint(0, 600) if posted == 0 else random.randint(600, 2100)
+            time.sleep(delay)
+
+        if send_post(item, ai, video_url, image_url):
+            seen.append(item["id"])
+            seen_set.add(item["id"])
+            posted += 1
+            save_state(seen)
+            if item["topic"] == "custom":
+                clear_custom_news()
+        time.sleep(5)
+
+    print(f"Успешно опубликовано за запуск: {posted}")
+
+if __name__ == "__main__":
+    main()
