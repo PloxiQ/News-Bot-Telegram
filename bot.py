@@ -41,12 +41,8 @@ FEEDS = [
 ]
 
 def channel_footer():
-    link = os.environ.get("CHANNEL_LINK", "").strip()
-    if not link and CHAT_ID.startswith("@"):
-        link = "https://t.me/" + CHAT_ID[1:]
-    if not link:
-        return ""
-    return f'📢 <a href="{html.escape(link, quote=True)}">Подписывайся на канал</a>'
+    # Убрали ссылку, так как она вызывает ошибку внутри самого канала
+    return ""
 
 def load_state():
     try:
@@ -117,21 +113,23 @@ def rewrite(item, article_text):
 
     source_text = article_text or item["summary"]
 
-prompt = (
-    "Ты главный редактор топового Telegram-канала про игры и нейросети. "
-    f"Стиль: {STYLE}\n"
-    "Твоя задача — сделать из этой новости идеальный пост на русском языке. "
-    "Верни строго JSON с полями:\n"
-    '"emoji": один подходящий эмодзи по теме,\n'
-    '"title": цепляющий, но правдивый заголовок до 80 символов,\n'
-    '"context": подробный контекст (2-3 предложения). Объясни суть, предысторию или почему это важно. До 400 символов,\n'
-    '"points": список из 2-3 коротких ключевых фактов (каждый до 90 символов),\n'
-    '"joke": короткая шутка или ироничный комментарий. ВАЖНО: если новость серьезная, оставь это поле пустым. Не шути над трагедиями или увольнениями. До 150 символов,\n'
-    '"hashtags": 2-3 хэштега без символа #,\n'
-    '"image_prompt": короткий промпт на английском для генерации картинки по теме новости (например, "cyberpunk city neon", "robot playing video game").\n'
-    "Ничего не выдумывай, используй только факты из текста. Если текст на английском - переведи всё на русский. Без markdown.\n\n"
-    f"Заголовок: {item['title']}\nТекст: {source_text}"
-)
+    prompt = (
+        "Ты креативный SMM-редактор топового Telegram-канала про игры и нейросети. "
+        f"Стиль: {STYLE}\n"
+        "Твоя главная цель — зацепить читателя так, чтобы он дочитал до конца и захотел переслать пост другу. "
+        "НЕ ИСПОЛЬЗУЙ ШАБЛОНЫ! Для каждой новости выбирай свой уникальный подход. "
+        "Ты можешь начать с вопроса, с шокирующего факта, с интриги или просто с короткого абзаца. "
+        "Можешь использовать маркированные списки, а можешь писать сплошным текстом. Реши сам, что лучше подойдет именно для этой новости. "
+        "Верни строго JSON с полями:\n"
+        '"emoji": один подходящий эмодзи по теме,\n'
+        '"title": цепляющий, кликбейтный (но правдивый) заголовок до 80 символов,\n'
+        '"body": основной текст поста (2-4 предложения или список фактов). Пиши живо, с эмодзи внутри текста, если это уместно. До 500 символов,\n'
+        '"joke": короткая шутка или ироничный вывод в конце. Если новость серьезная (трагедия, скандал) — оставь это поле пустым,\n'
+        '"hashtags": 2-3 хэштега без символа #,\n'
+        '"image_prompt": короткий промпт на английском для генерации картинки по теме новости.\n'
+        "Ничего не выдумывай, используй только факты из текста. Если текст на английском - переведи всё на русский. Без markdown.\n\n"
+        f"Заголовок: {item['title']}\nТекст: {source_text}"
+    )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
@@ -139,7 +137,7 @@ prompt = (
         "model": "openai/gpt-oss-20b", 
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
-        "temperature": 0.7 
+        "temperature": 0.8 
     }
 
     try:
@@ -148,14 +146,14 @@ prompt = (
         raw = r.json()["choices"][0]["message"]["content"].strip()
         raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
         data = json.loads(raw)
-        if not data.get("title") or not data.get("context"):
+        if not data.get("title") or not data.get("body"):
             return None
         return data
     except Exception as ex:
         print("groq failed:", ex)
         return None
 
-def build_post(item, ai, with_points=True):
+def build_post(item, ai):
     esc = html.escape
     default_icon = "🎮" if item["topic"] == "игры" else "🤖"
     category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ"
@@ -169,11 +167,9 @@ def build_post(item, ai, with_points=True):
     lines = [f"{icon} <b>{category}</b>", ""]
     lines.append(f"<b>{esc(str(ai['title']))}</b>")
     lines.append("")
-    lines.append(esc(str(ai["context"])))
-
-    points = [str(p) for p in (ai.get("points") or [])][:3]
-    if with_points and points:
-        lines += [""] + [f"🔹 {esc(p)}" for p in points]
+    
+    # Вставляем текст, который придумал ИИ (он сам решил, как его оформить)
+    lines.append(esc(str(ai.get("body", ""))))
 
     if ai.get("joke"):
         lines += ["", f"😂 <i>{esc(str(ai['joke']))}</i>"]
@@ -208,11 +204,10 @@ def send_post(item, ai, img):
         img = f"https://image.pollinations.ai/prompt/{prompt_encoded}?width=1080&height=720&nologo=true&seed={random.randint(1, 99999)}"
         print(f"Генерируем картинку: {img}")
 
-    # Если текст слишком длинный, убираем список фактов (Телеграм не любит длинные подписи)
+    # Если текст слишком длинный для подписи к фото, обрезаем его
     if len(text) > 1000:
-        text = build_post(item, ai, with_points=False)
+        text = text[:990] + "..."
 
-    # ИСПРАВЛЕНИЕ ОШИБКИ: Отправляем как multipart/form-data, а не JSON
     try:
         img_data = requests.get(img, headers={"User-Agent": "Mozilla/5.0"}, timeout=15).content
         
@@ -272,7 +267,12 @@ def main():
         if is_test:
             print("🧪 Тестовый режим: публикуем сразу...")
         else:
-            delay = random.randint(600, 6600) 
+            # 80% шанс на быструю публикацию (10-20 мин), 20% - на долгую (1-2 часа)
+            if random.random() < 0.8:
+                delay = random.randint(600, 1200) 
+            else:
+                delay = random.randint(3600, 7200) 
+                
             print(f"Ждем {delay // 60} мин. перед публикацией...")
             time.sleep(delay)
 
@@ -287,4 +287,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
