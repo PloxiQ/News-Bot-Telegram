@@ -16,31 +16,25 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHANNEL"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
-MAX_PER_RUN = 3      # Сколько постов максимум за 1 запуск (раз в час)
-MAX_AGE_HOURS = 12   # Берем только новости не старше 12 часов
+MAX_PER_RUN = 3      
+MAX_AGE_HOURS = 12   
 STATE_FILE = "posted.json"
 
 BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети", "github": "#github"}
 
-# 🚀 ОБНОВЛЕННЫЕ ИСТОЧНИКИ (Убрали сложный Хабр)
 FEEDS = [
-    # Игры (Русские)
     ("игры", "https://stopgame.ru/rss/rss_news.xml"),
     ("игры", "https://dtf.ru/rss/games"),
     ("игры", "https://www.igromania.ru/rss/news.xml"),
     ("игры", "https://vgtimes.ru/rss/news/"),
     ("игры", "https://www.playground.ru/rss/news.xml"),
-    # Игры (Иностранные)
     ("игры", "https://www.pcgamer.com/rss/"),
     ("игры", "https://www.eurogamer.net/feed"),
-    # Нейросети (Русские)
     ("нейросети", "https://vc.ru/rss/tag/нейросети"),
     ("нейросети", "https://3dnews.ru/news/rss/"),
     ("нейросети", "https://www.ixbt.com/export/news.rss"),
-    # Нейросети (Иностранные)
     ("нейросети", "https://techcrunch.com/category/artificial-intelligence/feed/"),
     ("нейросети", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
-    # Reddit (Мульти-реддит: только горячее)
     ("reddit", "https://www.reddit.com/r/gaming+pcgaming+GTA6+artificial+OpenAI+StableDiffusion/hot/.rss"),
 ]
 
@@ -66,7 +60,6 @@ def entry_time(e):
     t = e.get("published_parsed") or e.get("updated_parsed")
     return calendar.timegm(t) if t else None
 
-# === ФУНКЦИИ GITHUB ===
 def get_github_trending():
     try:
         url = "https://api.github.com/search/repositories"
@@ -91,7 +84,6 @@ def get_github_media(repo_full_name):
         pass
     return None
 
-# === ПАРСИНГ ТГ ===
 def fetch_from_telegram(channel_name):
     items = []
     try:
@@ -115,7 +107,6 @@ def fetch_from_telegram(channel_name):
         pass
     return items
 
-# === СБОР ДАННЫХ ===
 def collect():
     items = []
     for topic, url in FEEDS:
@@ -159,7 +150,6 @@ def fetch_article(url):
     text = " ".join(p for p in (clean(x) for x in paras) if len(p) > 60)
     return text[:4000], img
 
-# === ГЕНЕРАЦИЯ ТЕКСТА (СТРОГИЙ ПРОМПТ) ===
 def rewrite(item, article_text):
     if not GROQ_KEY: return None
     source_text = article_text or item["summary"]
@@ -190,19 +180,18 @@ def rewrite(item, article_text):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     
-    # ИСПОЛЬЗУЕМ САМУЮ УМНУЮ МОДЕЛЬ GROQ
+    # ИСПРАВЛЕННАЯ МОДЕЛЬ GROQ
     payload = {
-        "model": "llama-3.3-70b-versatile", 
+        "model": "openai/gpt-oss-120b", 
         "messages": [{"role": "user", "content": prompt}], 
         "response_format": {"type": "json_object"}, 
-        "temperature": 0.6 # Снизили температуру, чтобы не выдумывал факты
+        "temperature": 0.6
     }
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=45)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
-        # Очистка от случайных markdown-тегов
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
         data = json.loads(raw)
         
@@ -213,7 +202,6 @@ def rewrite(item, article_text):
         print("groq failed:", ex)
         return None
 
-# === СБОРКА ПОСТА ===
 def build_post(item, ai):
     esc = html.escape
     default_icon = "🎮" if item["topic"] == "игры" else "🤖" if item["topic"] == "нейросети" else "💻" if item["topic"] == "github" else "📰"
@@ -236,12 +224,9 @@ def build_post(item, ai):
             if f"#{clean_t}" not in tags: tags.append(f"#{clean_t}")
     if tags: lines += ["", " ".join(tags[:4])]
 
-    # Автограф канала
     lines += ["", link, "🤖 <a href='https://t.me/PloxiQNews'>@PloxiQNews</a>"]
-    
     return "\n".join(lines)
 
-# === ОТПРАВКА ===
 def send_post(item, ai, img):
     text = build_post(item, ai)
     if not text: return False
@@ -264,7 +249,6 @@ def send_post(item, ai, img):
     r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=30)
     return r.ok
 
-# === ГЛАВНЫЙ ЦИКЛ ===
 def main():
     seen = load_state()
     items = collect()
@@ -283,7 +267,7 @@ def main():
         ai = rewrite(item, article_text)
         
         if not ai:
-            continue # Если ИИ сказал "мусор" или не смог обработать
+            continue
 
         is_test = os.environ.get("TEST_RUN", "false").lower() == "true"
         
@@ -291,9 +275,9 @@ def main():
             print("🧪 Тестовый режим...")
         else:
             if posted_count == 0:
-                delay = random.randint(0, 600) # Первый пост: 0-10 минут
+                delay = random.randint(0, 600)
             else:
-                delay = random.randint(600, 2100) # Второй/третий: 10-35 минут
+                delay = random.randint(600, 2100)
             
             if delay > 0:
                 print(f"Ждем {delay // 60} мин. {delay % 60} сек. перед публикацией...")
