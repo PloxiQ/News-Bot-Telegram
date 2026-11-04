@@ -22,6 +22,9 @@ MAX_AGE_HOURS = 12
 STATE_FILE = "posted.json"
 CUSTOM_FILE = "custom_news.txt"
 
+# Ссылка на твой крутой баннер в качестве заглушки
+DEFAULT_IMAGE = "https://image.pollinations.ai/prompt/dark%20gaming%20setup%20neon%20red%20and%20blue?width=1080&height=720&nologo=true&model=flux" # Или можешь вставить ссылку на твой баннер, если загрузишь его куда-нибудь
+
 BASE_TAGS = {"игры": "#игры", "нейросети": "#нейросети", "github": "#github", "custom": "#эксклюзив", "thought": "#мысли"}
 
 FEEDS = [
@@ -67,24 +70,40 @@ def fetch_pixabay_image(query):
     try:
         url = "https://pixabay.com/api/"
         params = {
-            "key": PIXABAY_KEY,
-            "q": query,
-            "image_type": "photo",
-            "per_page": 3,
-            "safesearch": "true",
-            "order": "popular"
+            "key": PIXABAY_KEY, "q": query, "image_type": "photo",
+            "per_page": 3, "safesearch": "true", "order": "popular"
         }
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
         if data.get("hits"):
-            img = random.choice(data["hits"])
-            return img.get("largeImageURL")
+            return random.choice(data["hits"]).get("largeImageURL")
     except Exception as ex:
         print("pixabay failed:", ex)
     return None
 
-# === 2. ЭКСКЛЮЗИВЫ И МЫСЛИ ===
+# === 2. УЛУЧШЕННЫЙ ПАРСЕР GITHUB (Ищет и Markdown, и HTML) ===
+def get_github_media(repo_full_name):
+    try:
+        url = f"https://api.github.com/repos/{repo_full_name}/readme"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if r.status_code != 200: return None
+        
+        content = base64.b64decode(r.json()["content"]).decode("utf-8")
+        
+        # Ищем Markdown картинки: ![alt](url)
+        images = re.findall(r'!\[[^\]]*\]\((https?://[^\s\)]+)\)', content)
+        # Ищем HTML картинки: <img src="url">
+        images += re.findall(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', content)
+
+        for img in images:
+            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+                return img
+    except Exception:
+        pass
+    return None
+
+# === 3. ЭКСКЛЮЗИВЫ И МЫСЛИ ===
 def get_custom_news():
     try:
         with open(CUSTOM_FILE, "r", encoding="utf-8") as f:
@@ -110,13 +129,7 @@ def generate_thought():
         "Ты — автор крутого Telegram-канала про игры и нейросети. "
         "Напиши короткий пост (2-3 предложения), который не является новостью (вопрос к подписчикам или мысль). "
         "Верни строго JSON:\n"
-        '{\n'
-        '  "emoji": "1 эмодзи",\n'
-        '  "title": "Короткий заголовок (до 50 символов)",\n'
-        '  "body": "Текст поста (2-3 предложения)",\n'
-        '  "hashtags": ["тег1", "тег2"],\n'
-        '  "image_prompt": "ENGLISH PROMPT FOR AI IMAGE GENERATOR"\n'
-        "}\n"
+        '{"emoji": "1 эмодзи", "title": "Короткий заголовок", "body": "Текст", "hashtags": ["тег1"], "image_prompt": "Промпт"}'
     )
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
@@ -128,10 +141,8 @@ def generate_thought():
         raw = re.sub(r"^```(?:json)?|```$", "", r.json()["choices"][0]["message"]["content"].strip(), flags=re.M).strip()
         return json.loads(raw)
     except Exception as ex:
-        print("thought generation failed:", ex)
         return None
 
-# === 3. GITHUB И ПАРСИНГ ТГ ===
 def get_github_trending():
     try:
         url = "https://api.github.com/search/repositories"
@@ -141,20 +152,6 @@ def get_github_trending():
         return r.json().get("items", [])
     except Exception:
         return []
-
-def get_github_media(repo_full_name):
-    try:
-        url = f"https://api.github.com/repos/{repo_full_name}/readme"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return None
-        content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        images = re.findall(r'!\[[^\]]*\]\((https?://[^\s\)]+)\)', content)
-        for img in images:
-            if img.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                return img
-    except Exception:
-        pass
-    return None
 
 def fetch_from_telegram(channel_name):
     items = []
@@ -179,7 +176,6 @@ def fetch_from_telegram(channel_name):
         pass
     return items
 
-# === 4. СБОР ДАННЫХ (ЭТОГО И НЕ ХВАТАЛО!) ===
 def collect():
     items = []
     custom = get_custom_news()
@@ -211,7 +207,6 @@ def collect():
         
     return items
 
-# === 5. ПАРСИНГ СТАТЬИ ===
 def fetch_article(url):
     if url == "https://t.me/PloxiQNews": return "", None
     try:
@@ -228,7 +223,6 @@ def fetch_article(url):
     text = " ".join(p for p in (clean(x) for x in paras) if len(p) > 60)
     return text[:4000], img
 
-# === 6. ГЕНЕРАЦИЯ ТЕКСТА ===
 def rewrite(item, article_text):
     if not GROQ_KEY: return None
     source_text = article_text or item["summary"]
@@ -243,7 +237,7 @@ def rewrite(item, article_text):
         "3. Текст (body) строго 2-3 предложения.\n"
         "4. Шутка (joke) короткая и понятная. Если новость серьезная — пустая строка.\n"
         "5. Если исходный текст — вопрос или мем, ВЕРНИ ПУСТЫЕ СТРОКИ.\n\n"
-        "ВАЖНО ДЛЯ image_prompt: Напиши промпт на английском (2-4 слова, например 'gaming setup neon' или 'cyberpunk city'). НЕ пиши '8k', 'masterpiece' и прочий мусор. Никаких людей и лиц."
+        "ВАЖНО ДЛЯ image_prompt: Напиши промпт на английском (2-3 слова для поиска на фотостоках, например 'gaming setup' или 'cyberpunk city')."
         "\n\nВерни ответ СТРОГО в формате JSON:\n"
         '{"emoji": "1 эмодзи", "title": "Заголовок", "body": "Текст", "joke": "Шутка", "hashtags": ["тег1"], "image_prompt": "Промпт"}'
     )
@@ -263,18 +257,13 @@ def rewrite(item, article_text):
         print("groq failed:", ex)
         return None
 
-# === 7. СБОРКА ПОСТА ===
 def build_post(item, ai):
     esc = html.escape
     
     if item["topic"] == "thought":
-        category = "МЫСЛИ ВСЛУХ"
-        default_icon = "💭"
-        link = ""
+        category, default_icon, link = "МЫСЛИ ВСЛУХ", "💭", ""
     elif item["topic"] == "custom":
-        category = "ЭКСКЛЮЗИВ"
-        default_icon = "🔥"
-        link = "🔥 <b>Наш эксклюзив!</b>"
+        category, default_icon, link = "ЭКСКЛЮЗИВ", "🔥", "🔥 <b>Наш эксклюзив!</b>"
     else:
         default_icon = "🎮" if item["topic"] == "игры" else "🤖" if item["topic"] == "нейросети" else "💻" if item["topic"] == "github" else "📰"
         category = "ИГРОВЫЕ НОВОСТИ" if item["topic"] == "игры" else "НЕЙРОСЕТИ" if item["topic"] == "нейросети" else "ТРЕНДЫ GITHUB" if item["topic"] == "github" else "НОВОСТИ"
@@ -300,27 +289,22 @@ def build_post(item, ai):
     lines += ["", "🤖 <a href='https://t.me/PloxiQNews'>@PloxiQNews</a>"]
     return "\n".join(lines)
 
-# === 8. ОТПРАВКА С ВЫБОРОМ КАРТИНКИ ===
 def send_post(item, ai, img):
     text = build_post(item, ai)
     if not text: return False
 
-    # ЛОГИКА ВЫБОРА КАРТИНКИ:
+    # --- ЛОГИКА ВЫБОРА КАРТИНКИ (БЕЗ ГЕНЕРАЦИИ ИИ) ---
     
-    # 1. Если картинка уже есть с сайта / GitHub / TG
-    if img and img.startswith("http"):
-        print("Используем картинку с сайта-источника.")
-    else:
-        # 2. Если нет, ищем на Pixabay
-        query = ai.get("image_prompt", "gaming")
+    # 1. Картинка с сайта / GitHub / TG
+    if not img or not img.startswith("http"):
+        # 2. Если нет — ищем на Pixabay
+        query = ai.get("image_prompt", "gaming setup")
         img = fetch_pixabay_image(query)
-        if img:
-            print(f"Картинки на сайте нет. Pixabay нашел фото по запросу: {query}")
-        else:
-            # 3. Если Pixabay пуст, генерируем через Pollinations
-            print(f"Pixabay не нашел ничего по запросу '{query}'. Генерируем через ИИ.")
-            prompt = f"{query}, highly detailed, realistic, cinematic lighting, 8k"
-            img = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1080&height=720&nologo=true&seed={random.randint(1, 99999)}&model=flux"
+        
+        # 3. Если и там нет — ставим дефолтную заглушку
+        if not img:
+            print("Ничего не нашли, ставим дефолтную обложку.")
+            img = DEFAULT_IMAGE
 
     if len(text) > 1000: text = text[:990] + "..."
 
@@ -331,11 +315,9 @@ def send_post(item, ai, img):
     except Exception as e:
         print("Ошибка скачивания картинки:", e)
 
-    # Если картинка битая, шлем просто текст
     r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=30)
     return r.ok
 
-# === 9. ГЛАВНЫЙ ЦИКЛ ===
 def main():
     seen = load_state()
     items = collect()
@@ -348,15 +330,6 @@ def main():
         candidates.insert(0, items[0])
     
     posted_count = 0
-
-    make_thought = random.random() < 0.15
-    if make_thought:
-        print("💭 Решаем написать пост-мысль...")
-        thought_ai = generate_thought()
-        if thought_ai:
-            thought_item = {"topic": "thought", "link": "", "media": None}
-            if send_post(thought_item, thought_ai, None):
-                posted_count += 1
 
     for item in candidates:
         if posted_count >= MAX_PER_RUN: 
