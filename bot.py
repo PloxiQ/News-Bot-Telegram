@@ -497,58 +497,7 @@ def fetch_article(url):
 
 
 # ======================= GROQ =======================
-def groq_json(prompt, temperature=0.6):
-    if not GROQ_KEY:
-        return None
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    for model in GROQ_MODELS:
-        payload = {
-            "model": model, "temperature": temperature,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-        }
-        for attempt in range(2):
-            try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers, json=payload, timeout=60,
-                )
-                if r.status_code == 429:
-                    time.sleep(8)
-                    continue
-                r.raise_for_status()
-                raw = r.json()["choices"][0]["message"]["content"]
-                m = re.search(r"\{.*\}", raw, re.S)
-                return json.loads(m.group(0)) if m else None
-            except Exception as e:
-                print(f"Groq {model} failed:", e)
-                break
-    return None
-
-
-def rewrite(item, article_text):
-    source_text = (article_text or item["summary"])[:3500]
-    prompt = (
-        "Ты — топовый SMM-редактор Telegram-канала про игры и нейросети. "
-        "Делай сочные, короткие посты.\n"
-        f"Тема: {item['topic']}\n"
-        f"Заголовок новости: {item['title']}\n"
-        f"Исходный текст: {source_text}\n\n"
-        "ПРАВИЛА:\n"
-        "1. Никаких цитат из исходника — перескажи суть своими словами, по-русски.\n"
-        "2. title — короткий цепляющий заголовок, обычный текст БЕЗ тегов.\n"
-        "3. body — 2-4 предложения. Можно использовать ТОЛЬКО теги <b></b> (1-3 раза "
-        "для ключевых слов) и <i></i>. Никаких других тегов и markdown.\n"
-        "4. quote — одна короткая мысль/вывод до 120 символов, обычный текст, "
-        "не повторяющий body. Если нечего сказать — пустая строка.\n"
-        "5. joke — короткая понятная шутка обычным текстом. Для серьёзных новостей — пустая строка.\n"
-        "6. Если topic = мемы — переведи шутку на русский и адаптируй; quote оставь пустым.\n"
-        "7. image_prompt — 2-3 слова на английском для поиска фото.\n\n"
-        "Верни СТРОГО JSON:\n"
-        '{"emoji": "1 эмодзи", "title": "...", "body": "...", "quote": "...", '
-        '"joke": "...", "image_prompt": "..."}'
-    )
-        data = groq_json(prompt)
+    data = groq_json(prompt)
     if isinstance(data, dict) and data.get("title") and data.get("body"):
         return data
     return None
@@ -756,3 +705,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
