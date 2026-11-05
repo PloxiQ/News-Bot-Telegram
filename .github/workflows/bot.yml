@@ -28,7 +28,7 @@ jobs:
           TG_CHANNEL: ${{ secrets.TG_CHANNEL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          TEST_RUN: "true"
+          TEST_RUN: "false"
 
       # ВОТ ЭТОТ БЛОК ОЧЕНЬ ВАЖЕН, НЕ УДАЯТЬ!Л
       - name: save state
