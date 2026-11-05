@@ -588,9 +588,10 @@ def rewrite(item, article_text):
         "6. image_prompt — 2-3 слова на английском для поиска фото.\n"
         "7. hype — число от 1 до 10 (насколько новость хайповая).\n"
         "8. verdict — короткий вердикт (например: 'Брать', 'Ждать скидку', 'Пропустить', 'Топчик').\n"
-        f"{meme_rule}\n"
-        "Верни СТРОГО JSON:\n"
-        '{"emoji": "1 эмодзи", "title": "...", "body": "...", "quote": "...", "joke": "...", '
+         f"{meme_rule}\n"
+         "Верни СТРОГО JSON:\n"
+          '{"emoji": "1 эмодзи", "title": "...", "body": "...", "quote": "...", "joke": "...", '
+         f'"image_prompt": "...", "hype": 5, "verdict": "...{meme_field}}'
         f'"image_prompt": "...", "hype": 5, "verdict": "..."{meme_field}}}'
     )
     data = groq_json(prompt)
