@@ -595,7 +595,7 @@ def rewrite(item, article_text):
 f"{meme_rule}\n"
          "Верни СТРОГО JSON:\n"
           '{"emoji": "1 эмодзи", "title": "...", "body": "...", "quote": "...", "joke": "...", '
-         f'"image_prompt": "...", "hype": 5, "verdict": "...{meme_field}}'
+         f'"image_prompt": "...", "hype": 5, "verdict": "...{meme_field}"'
         f'"image_prompt": "...", "hype": 5, "verdict": "..."{meme_field}}}'
     )
     data = groq_json(prompt)
