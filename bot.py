@@ -577,36 +577,43 @@ def send_post(item, ai, video_url, image_url):
 
 
 def main():
-    seen = load_state()
-
-    # Только ручные новости: сначала личка, потом custom_news.txt. Автопарсинга нет.
-    custom = get_custom_news() or get_file_news()
+    print("Бот проснулся...")
+    
+    # 1. Сразу проверяем сообщения от тебя
+    custom = get_custom_news()
+    
+    # 2. Если ты ничего не прислал — выключаемся
     if not custom:
-        print("Нет новых новостей от админа. Выходим.")
+        print("Нет новых сообщений от админа. Выходим.")
         return
 
+    # 3. Если сообщение есть — берем текст и картинку
     article_text = custom["summary"]
     image_url = custom.get("media")
     video_url = None
 
+    # 4. Переписываем текст в твоем стиле
     ai = rewrite(custom, article_text)
     if not ai:
         print("Не удалось сгенерировать пост.")
         return
 
-    print("Публикуем пост...")
+    # 5. Публикуем
+    print("Публикуем пост от админа...")
     msg_id = send_post(custom, ai, video_url, image_url)
+    
     if msg_id:
+        seen = load_state()
         seen.append(custom["id"])
         save_state(seen)
-
+        
+        # Ставим огонек
         tg_call("setMessageReaction", {
             "chat_id": CHAT_ID,
             "message_id": msg_id,
             "reaction": json.dumps([{"type": "emoji", "emoji": "🔥"}])
         })
         print("Успешно опубликовано!")
-
 
 if __name__ == "__main__":
     main()
